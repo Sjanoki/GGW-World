@@ -1,5 +1,10 @@
 use core::f64::consts::PI;
 
+pub const PLANET_RADIUS_M: f64 = 6_371_000.0;
+pub const GRAVITY_WELL_RADIUS_M: f64 = 1_500_000_000.0;
+pub const GRAVITY_WELL_ALTITUDE_M: f64 = GRAVITY_WELL_RADIUS_M - PLANET_RADIUS_M;
+pub const DESPAWN_RADIUS_M: f64 = PLANET_RADIUS_M + 3.0 * GRAVITY_WELL_ALTITUDE_M;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vec2 {
     pub x: f64,
@@ -156,8 +161,14 @@ fn clamp(value: f64, min: f64, max: f64) -> f64 {
 
 /// Convert an OrbitState into Cartesian position/velocity at time `t`.
 pub fn orbit_to_cartesian(orbit: &OrbitState, mu: f64, t: f64) -> (Vec2, Vec2) {
-    assert!(orbit.semi_major_axis > 0.0, "semi-major axis must be positive");
-    assert!(orbit.eccentricity >= 0.0 && orbit.eccentricity < 1.0, "eccentricity out of range");
+    assert!(
+        orbit.semi_major_axis > 0.0,
+        "semi-major axis must be positive"
+    );
+    assert!(
+        orbit.eccentricity >= 0.0 && orbit.eccentricity < 1.0,
+        "eccentricity out of range"
+    );
 
     let a = orbit.semi_major_axis;
     let e = orbit.eccentricity;
@@ -194,10 +205,7 @@ pub fn orbit_to_cartesian(orbit: &OrbitState, mu: f64, t: f64) -> (Vec2, Vec2) {
     let cos_w = orbit.arg_of_periapsis.cos();
     let sin_w = orbit.arg_of_periapsis.sin();
 
-    let position = Vec2::new(
-        cos_w * x_orb - sin_w * y_orb,
-        sin_w * x_orb + cos_w * y_orb,
-    );
+    let position = Vec2::new(cos_w * x_orb - sin_w * y_orb, sin_w * x_orb + cos_w * y_orb);
     let velocity = Vec2::new(
         cos_w * vx_orb - sin_w * vy_orb,
         sin_w * vx_orb + cos_w * vy_orb,
@@ -222,7 +230,10 @@ pub fn cartesian_to_orbit(position: Vec2, velocity: Vec2, mu: f64, t: f64) -> Or
     let v_vec = velocity;
     let v_radial = if r > 0.0 { r_vec.dot(v_vec) / r } else { 0.0 };
     let term1 = v_sq - mu / r;
-    let e_vec = r_vec.scale(term1).sub(v_vec.scale(v_radial).scale(r)).scale(1.0 / mu);
+    let e_vec = r_vec
+        .scale(term1)
+        .sub(v_vec.scale(v_radial).scale(r))
+        .scale(1.0 / mu);
     let mut e = e_vec.length();
     if e < 1e-12 {
         e = 0.0;
@@ -233,7 +244,11 @@ pub fn cartesian_to_orbit(position: Vec2, velocity: Vec2, mu: f64, t: f64) -> Or
         omega = 0.0;
     }
 
-    let r_hat = if r > 0.0 { r_vec.scale(1.0 / r) } else { Vec2::zero() };
+    let r_hat = if r > 0.0 {
+        r_vec.scale(1.0 / r)
+    } else {
+        Vec2::zero()
+    };
     let mut true_anomaly = r_hat.y.atan2(r_hat.x) - omega;
     true_anomaly = normalize_angle(true_anomaly);
 
@@ -261,6 +276,7 @@ pub struct World {
     pub mu: f64,
     pub sim_time: f64,
     pub bodies: Vec<BodyState>,
+    pub planet_radius: f64,
     next_id: u64,
 }
 
@@ -270,6 +286,7 @@ impl World {
             mu,
             sim_time: 0.0,
             bodies: Vec::new(),
+            planet_radius: PLANET_RADIUS_M,
             next_id: 1,
         }
     }
@@ -298,6 +315,16 @@ impl World {
             body.position = pos;
             body.velocity = vel;
         }
+        self.cull_despawned_bodies();
+    }
+
+    pub fn is_inside_gravity_well(&self, body: &BodyState) -> bool {
+        body.position.length() <= GRAVITY_WELL_RADIUS_M
+    }
+
+    pub fn cull_despawned_bodies(&mut self) {
+        self.bodies
+            .retain(|body| body.position.length() <= DESPAWN_RADIUS_M);
     }
 
     pub fn apply_thrust_event(&mut self, event: &ThrustEvent) {
@@ -317,12 +344,17 @@ impl World {
     pub fn detect_collisions(&self, dt: f64) -> Vec<CollisionEvent> {
         let target_time = self.sim_time + dt;
         let mut events = Vec::new();
+        let mut future_states = Vec::with_capacity(self.bodies.len());
+        for body in &self.bodies {
+            future_states.push(orbit_to_cartesian(&body.orbit, self.mu, target_time));
+        }
+
         for i in 0..self.bodies.len() {
             for j in (i + 1)..self.bodies.len() {
                 let body_a = &self.bodies[i];
                 let body_b = &self.bodies[j];
-                let (pos_a, vel_a) = orbit_to_cartesian(&body_a.orbit, self.mu, target_time);
-                let (pos_b, vel_b) = orbit_to_cartesian(&body_b.orbit, self.mu, target_time);
+                let (pos_a, vel_a) = future_states[i];
+                let (pos_b, vel_b) = future_states[j];
                 let dist = pos_a.sub(pos_b).length();
                 if dist <= body_a.radius + body_b.radius {
                     let relative_velocity = vel_b.sub(vel_a);
@@ -337,6 +369,25 @@ impl World {
                 }
             }
         }
+
+        for (body, &(position, velocity)) in self.bodies.iter().zip(future_states.iter()) {
+            let altitude = position.length();
+            if altitude <= self.planet_radius + body.radius {
+                let contact_point = if altitude > 1e-6 {
+                    position.normalized().scale(self.planet_radius)
+                } else {
+                    Vec2::zero()
+                };
+                events.push(CollisionEvent {
+                    time: target_time,
+                    body_a: body.id,
+                    body_b: 0,
+                    relative_velocity: velocity,
+                    contact_point,
+                });
+            }
+        }
+
         events
     }
 }
@@ -348,13 +399,7 @@ mod tests {
     const MU_EARTH: f64 = 3.986004418e14;
 
     fn approx_eq(a: f64, b: f64, eps: f64) {
-        assert!(
-            (a - b).abs() <= eps,
-            "{} !~= {} (tol {})",
-            a,
-            b,
-            eps
-        );
+        assert!((a - b).abs() <= eps, "{} !~= {} (tol {})", a, b, eps);
     }
 
     #[test]
@@ -417,12 +462,7 @@ mod tests {
 
         let burn_time = 500.0;
         let (pos, _vel) = orbit_to_cartesian(
-            &world
-                .bodies
-                .iter()
-                .find(|b| b.id == body_id)
-                .unwrap()
-                .orbit,
+            &world.bodies.iter().find(|b| b.id == body_id).unwrap().orbit,
             world.mu,
             burn_time,
         );
