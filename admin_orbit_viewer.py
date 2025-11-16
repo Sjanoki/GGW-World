@@ -9,11 +9,12 @@ import os
 import subprocess
 import sys
 from collections import defaultdict, deque
-from typing import Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pygame
 
-WINDOW_SIZE = 900
+WINDOW_WIDTH = 900
+WINDOW_HEIGHT = 900
 TRAIL_LENGTH = 300
 BACKGROUND_COLOR = (5, 8, 12)
 PLANET_COLOR = (30, 60, 120)
@@ -42,6 +43,7 @@ class ViewerState:
         self.pan_start_mouse: Tuple[int, int] = (0, 0)
         self.pan_start_center: Tuple[float, float] = (0.0, 0.0)
         self.selected_id: Optional[int] = None
+        self.selected_planet: bool = False
 
 
 def server_binary_path() -> str:
@@ -66,8 +68,12 @@ def launch_server() -> subprocess.Popen:
 
 
 def init_pygame() -> Tuple[pygame.Surface, pygame.font.Font]:
+    global WINDOW_WIDTH, WINDOW_HEIGHT
+
     pygame.init()
-    screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
+    info = pygame.display.Info()
+    WINDOW_WIDTH, WINDOW_HEIGHT = info.current_w, info.current_h
+    screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.FULLSCREEN)
     pygame.display.set_caption("GGW Orbital Viewer")
     font = pygame.font.SysFont("consolas", 18)
     return screen, font
@@ -89,7 +95,7 @@ def ensure_base_scale(snapshot: Dict, state: ViewerState) -> None:
     if max_r <= 0.0:
         max_r = 1.0
 
-    usable_radius = 0.9 * (WINDOW_SIZE / 2.0)
+    usable_radius = 0.9 * (min(WINDOW_WIDTH, WINDOW_HEIGHT) / 2.0)
     base_scale = usable_radius / max_r
     if base_scale <= 0.0:
         base_scale = 1e-6
@@ -110,12 +116,29 @@ def world_to_screen(
     base_scale: float,
     zoom_factor: float,
 ) -> Tuple[int, int]:
-    cx = WINDOW_SIZE / 2.0
-    cy = WINDOW_SIZE / 2.0
+    cx = WINDOW_WIDTH / 2.0
+    cy = WINDOW_HEIGHT / 2.0
     scale = base_scale * zoom_factor
     screen_x = cx + (x - cam_center[0]) * scale
     screen_y = cy - (y - cam_center[1]) * scale
     return int(screen_x), int(screen_y)
+
+
+def screen_to_world(
+    sx: float,
+    sy: float,
+    cam_center: Sequence[float],
+    base_scale: float,
+    zoom_factor: float,
+) -> Tuple[float, float]:
+    cx = WINDOW_WIDTH / 2.0
+    cy = WINDOW_HEIGHT / 2.0
+    scale = base_scale * zoom_factor
+    if scale == 0.0:
+        return cam_center[0], cam_center[1]
+    wx = cam_center[0] + (sx - cx) / scale
+    wy = cam_center[1] - (sy - cy) / scale
+    return wx, wy
 
 
 def meters_to_pixels(radius_m: float, base_scale: float, zoom_factor: float) -> int:
@@ -124,25 +147,16 @@ def meters_to_pixels(radius_m: float, base_scale: float, zoom_factor: float) -> 
     return max(1, abs(pixels))
 
 
-def update_trails(trails: Dict[int, Deque[Tuple[int, int]]], snapshot: Dict, state: ViewerState) -> None:
-    if state.base_scale is None:
-        return
+def update_trails(trails: Dict[int, Deque[Tuple[float, float]]], snapshot: Dict) -> None:
     for body in snapshot.get("bodies", []):
         body_id = body["id"]
-        sx, sy = world_to_screen(
-            body["x"],
-            body["y"],
-            state.camera_center_world,
-            state.base_scale,
-            state.zoom_factor,
-        )
         trail = trails[body_id]
-        trail.append((sx, sy))
+        trail.append((body.get("x", 0.0), body.get("y", 0.0)))
         if len(trail) > TRAIL_LENGTH:
             trail.popleft()
 
 
-def prune_trails(trails: Dict[int, Deque[Tuple[int, int]]], current_ids: Iterable[int]) -> None:
+def prune_trails(trails: Dict[int, Deque[Tuple[float, float]]], current_ids: Iterable[int]) -> None:
     valid = set(current_ids)
     for body_id in list(trails.keys()):
         if body_id not in valid:
@@ -160,18 +174,11 @@ def handle_events(snapshot: Optional[Dict], state: ViewerState) -> bool:
                 state.zoom_factor *= ZOOM_STEP
             elif event.y < 0:
                 state.zoom_factor /= ZOOM_STEP
+            state.zoom_factor = max(state.zoom_factor, state.zoom_factor_min)
             if state.zoom_factor_max is not None:
-                state.zoom_factor = clamp(
-                    state.zoom_factor,
-                    state.zoom_factor_min,
-                    state.zoom_factor_max,
-                )
+                state.zoom_factor = min(state.zoom_factor, state.zoom_factor_max)
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            body_id = find_body_under_cursor(snapshot, event.pos, state)
-            if body_id is not None:
-                state.selected_id = body_id
-                state.is_panning = False
-            else:
+            if not attempt_selection(snapshot, state, event.pos):
                 state.is_panning = True
                 state.pan_start_mouse = event.pos
                 state.pan_start_center = tuple(state.camera_center_world)
@@ -210,11 +217,39 @@ def find_body_under_cursor(
     return best_id
 
 
+def attempt_selection(snapshot: Optional[Dict], state: ViewerState, mouse_pos: Tuple[int, int]) -> bool:
+    if snapshot is None or state.base_scale is None:
+        return False
+
+    planet_radius = snapshot.get("planet_radius_m", 0.0)
+    wx, wy = screen_to_world(
+        mouse_pos[0],
+        mouse_pos[1],
+        state.camera_center_world,
+        state.base_scale,
+        state.zoom_factor,
+    )
+    distance = math.hypot(wx, wy)
+    if planet_radius > 0.0 and distance <= planet_radius * 1.02:
+        state.selected_planet = True
+        state.selected_id = None
+        state.is_panning = False
+        return True
+
+    body_id = find_body_under_cursor(snapshot, mouse_pos, state)
+    if body_id is not None:
+        state.selected_planet = False
+        state.selected_id = body_id
+        state.is_panning = False
+        return True
+    return False
+
+
 def draw_snapshot(
     screen: pygame.Surface,
     font: pygame.font.Font,
     snapshot: Dict,
-    trails: Dict[int, Deque[Tuple[int, int]]],
+    trails: Dict[int, Deque[Tuple[float, float]]],
     state: ViewerState,
 ) -> None:
     if state.base_scale is None:
@@ -234,13 +269,26 @@ def draw_snapshot(
 
     planet_px = meters_to_pixels(planet_radius_m, base_scale, zoom_factor)
     pygame.draw.circle(screen, PLANET_COLOR, origin_px, planet_px)
+    if state.selected_planet:
+        pygame.draw.circle(
+            screen,
+            (255, 255, 255),
+            origin_px,
+            max(planet_px + 3, planet_px + 1),
+            width=2,
+        )
 
     draw_optional_ring(screen, origin_px, gravity_well_radius, base_scale, zoom_factor, GRAVITY_WELL_COLOR)
     draw_optional_ring(screen, origin_px, despawn_radius, base_scale, zoom_factor, DESPAWN_COLOR)
 
     for trail in trails.values():
-        if len(trail) >= 2:
-            pygame.draw.lines(screen, TRAIL_COLOR, False, list(trail), 1)
+        if len(trail) < 2:
+            continue
+        projected = [
+            world_to_screen(wx, wy, cam_center, base_scale, zoom_factor)
+            for wx, wy in trail
+        ]
+        pygame.draw.lines(screen, TRAIL_COLOR, False, projected, 1)
 
     selected_id = state.selected_id
     for body in snapshot.get("bodies", []):
@@ -279,7 +327,7 @@ def draw_optional_ring(
     radius_px = meters_to_pixels(radius_m, base_scale, zoom_factor)
     if radius_px < 10:
         return
-    if radius_px > WINDOW_SIZE * 4:
+    if radius_px > max(WINDOW_WIDTH, WINDOW_HEIGHT) * 4:
         return
     pygame.draw.circle(screen, color, center, radius_px, width=1)
 
@@ -300,49 +348,63 @@ def draw_selected_popup(
     snapshot: Dict,
     state: ViewerState,
 ) -> None:
-    if state.selected_id is None:
+    lines: Optional[List[str]] = None
+
+    if state.selected_planet:
+        planet_radius = snapshot.get("planet_radius_m", 6_371_000.0)
+        gravity_well = snapshot.get("gravity_well_radius_m", planet_radius)
+        despawn = snapshot.get("despawn_radius_m", gravity_well)
+        lines = [
+            "Planet",
+            f"Radius: {format_distance(planet_radius)}",
+            f"Gravity well: {format_distance(gravity_well)}",
+            f"Despawn: {format_distance(despawn)}",
+        ]
+    elif state.selected_id is not None:
+        body = next((b for b in snapshot.get("bodies", []) if b["id"] == state.selected_id), None)
+        if body is None:
+            return
+
+        x = body.get("x", 0.0)
+        y = body.get("y", 0.0)
+        vx = body.get("vx", 0.0)
+        vy = body.get("vy", 0.0)
+        body_type = body.get("body_type", "Unknown")
+        radius_m = body.get("radius_m", 0.0)
+        planet_radius = snapshot.get("planet_radius_m", 6_371_000.0)
+        mu = snapshot.get("mu", 0.0)
+
+        r = math.hypot(x, y)
+        altitude = max(0.0, r - planet_radius)
+        speed = math.hypot(vx, vy)
+
+        semi_major_axis = None
+        if mu > 0.0 and r > 0.0:
+            denom = 2.0 / r - (speed * speed) / mu
+            if abs(denom) > 1e-12:
+                semi_major_axis = 1.0 / denom
+        period_hours = None
+        if semi_major_axis and semi_major_axis > 0.0 and mu > 0.0:
+            period_seconds = 2.0 * math.pi * math.sqrt(semi_major_axis ** 3 / mu)
+            period_hours = period_seconds / 3600.0
+
+        lines = [
+            f"ID {body['id']} ({body_type})",
+            f"Alt: {format_distance(altitude)}",
+            f"Speed: {speed / 1000.0:.2f} km/s",
+            f"Radius: {format_distance(radius_m)}",
+        ]
+        if period_hours is not None:
+            lines.append(f"Period: {period_hours:.2f} h")
+
+    if not lines:
         return
-    body = next((b for b in snapshot.get("bodies", []) if b["id"] == state.selected_id), None)
-    if body is None:
-        return
-
-    x = body.get("x", 0.0)
-    y = body.get("y", 0.0)
-    vx = body.get("vx", 0.0)
-    vy = body.get("vy", 0.0)
-    body_type = body.get("body_type", "Unknown")
-    radius_m = body.get("radius_m", 0.0)
-    planet_radius = snapshot.get("planet_radius_m", 6_371_000.0)
-    mu = snapshot.get("mu", 0.0)
-
-    r = math.hypot(x, y)
-    altitude = max(0.0, r - planet_radius)
-    speed = math.hypot(vx, vy)
-
-    semi_major_axis = None
-    if mu > 0.0 and r > 0.0:
-        denom = 2.0 / r - (speed * speed) / mu
-        if abs(denom) > 1e-12:
-            semi_major_axis = 1.0 / denom
-    period_hours = None
-    if semi_major_axis and semi_major_axis > 0.0 and mu > 0.0:
-        period_seconds = 2.0 * math.pi * math.sqrt(semi_major_axis ** 3 / mu)
-        period_hours = period_seconds / 3600.0
-
-    lines = [
-        f"ID {body['id']} ({body_type})",
-        f"Alt: {format_distance(altitude)}",
-        f"Speed: {speed / 1000.0:.2f} km/s",
-        f"Radius: {format_distance(radius_m)}",
-    ]
-    if period_hours is not None:
-        lines.append(f"Period: {period_hours:.2f} h")
 
     padding = 8
     line_height = font.get_linesize()
     width = max(font.size(text)[0] for text in lines) + padding * 2
     height = line_height * len(lines) + padding * 2
-    rect = pygame.Rect(WINDOW_SIZE - width - 20, 20, width, height)
+    rect = pygame.Rect(WINDOW_WIDTH - width - 20, 20, width, height)
     pygame.draw.rect(screen, (15, 20, 30), rect)
     pygame.draw.rect(screen, (100, 120, 150), rect, 1)
 
@@ -356,7 +418,9 @@ def draw_selected_popup(
 def main() -> None:
     server = launch_server()
     screen, font = init_pygame()
-    trails: Dict[int, Deque[Tuple[int, int]]] = defaultdict(lambda: deque(maxlen=TRAIL_LENGTH))
+    trails: Dict[int, Deque[Tuple[float, float]]] = defaultdict(
+        lambda: deque(maxlen=TRAIL_LENGTH)
+    )
     state = ViewerState()
     snapshot: Optional[Dict] = None
 
@@ -380,7 +444,7 @@ def main() -> None:
             if state.selected_id is not None and state.selected_id not in current_ids:
                 state.selected_id = None
 
-            update_trails(trails, snapshot, state)
+            update_trails(trails, snapshot)
             draw_snapshot(screen, font, snapshot, trails, state)
     except KeyboardInterrupt:
         pass
