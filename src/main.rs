@@ -355,8 +355,18 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
             if x > 0 {
                 json.push(',');
             }
-            let tile_name = ship.tile_type(x, y).as_str();
-            json.push_str(&format!("\"{}\"", tile_name));
+            let tile_type = ship.tile_type(x, y);
+            json.push('{');
+            json.push_str(&format!("\"type\":\"{}\"", tile_type.as_str()));
+            if let Some(sample) = ship.tile_atmos_sample(x, y) {
+                json.push_str(&format!(
+                    ",\"atmos\":{{\"pressure_kpa\":{},\"o2_fraction\":{},\"n2_fraction\":{},\"co2_fraction\":{}}}",
+                    sample.pressure_kpa, sample.o2_fraction, sample.n2_fraction, sample.co2_fraction
+                ));
+            } else {
+                json.push_str(",\"atmos\":null");
+            }
+            json.push('}');
         }
         json.push(']');
     }

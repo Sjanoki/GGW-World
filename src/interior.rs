@@ -31,6 +31,14 @@ pub enum GasType {
     Xenon,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AtmosSample {
+    pub pressure_kpa: f32,
+    pub o2_fraction: f32,
+    pub n2_fraction: f32,
+    pub co2_fraction: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct AtmosCell {
     pub o2_kg: f32,
@@ -44,6 +52,20 @@ impl AtmosCell {
             o2_kg,
             n2_kg,
             co2_kg,
+        }
+    }
+
+    pub fn sample(&self) -> AtmosSample {
+        const KPA_PER_KG: f32 = 0.5;
+        let total = self.o2_kg + self.n2_kg + self.co2_kg;
+        if total <= f32::EPSILON {
+            return AtmosSample::default();
+        }
+        AtmosSample {
+            pressure_kpa: total * KPA_PER_KG,
+            o2_fraction: (self.o2_kg / total).clamp(0.0, 1.0),
+            n2_fraction: (self.n2_kg / total).clamp(0.0, 1.0),
+            co2_fraction: (self.co2_kg / total).clamp(0.0, 1.0),
         }
     }
 }
@@ -292,8 +314,9 @@ impl ShipInterior {
         let door_x = width / 2;
         let door_y = height - 1;
         tiles[Self::idx(door_x, door_y, width)].tile_type = TileType::DoorOpen;
-        // bed area
+        // bed area occupies two tiles
         tiles[Self::idx(2, 2, width)].tile_type = TileType::Bed;
+        tiles[Self::idx(3, 2, width)].tile_type = TileType::Bed;
 
         let atmos = AtmosCell::new(50.0, 150.0, 0.5);
         let power = PowerState::default();
@@ -377,7 +400,7 @@ impl ShipInterior {
             id: next_id,
             device_type: DeviceType::Transponder,
             x: 8,
-            y: 2,
+            y: 1,
             w: 2,
             h: 1,
             power_kw: 5.0,
@@ -392,9 +415,9 @@ impl ShipInterior {
         devices.push(Device {
             id: next_id,
             device_type: DeviceType::NavStation,
-            x: 7,
+            x: 8,
             y: 3,
-            w: 1,
+            w: 2,
             h: 1,
             power_kw: 1.5,
             online: true,
@@ -406,7 +429,7 @@ impl ShipInterior {
             id: next_id,
             device_type: DeviceType::ShipComputer,
             x: 8,
-            y: 4,
+            y: 5,
             w: 2,
             h: 1,
             power_kw: 2.5,
@@ -420,7 +443,7 @@ impl ShipInterior {
             device_type: DeviceType::BedDevice,
             x: 2,
             y: 2,
-            w: 1,
+            w: 2,
             h: 1,
             power_kw: 0.0,
             online: true,
@@ -492,6 +515,24 @@ impl ShipInterior {
         self.tile(x, y)
             .map(|t| t.tile_type)
             .unwrap_or(TileType::Empty)
+    }
+
+    fn tile_supports_atmos(tile_type: TileType) -> bool {
+        matches!(
+            tile_type,
+            TileType::Floor | TileType::Bed | TileType::DoorOpen
+        )
+    }
+
+    pub fn tile_atmos_sample(&self, x: u32, y: u32) -> Option<AtmosSample> {
+        if !self.in_bounds(x as i32, y as i32) {
+            return None;
+        }
+        let tile_type = self.tile_type(x, y);
+        if !Self::tile_supports_atmos(tile_type) {
+            return None;
+        }
+        Some(self.atmos.sample())
     }
 
     pub fn is_passable(&self, x: i32, y: i32) -> bool {
@@ -972,8 +1013,39 @@ mod tests {
             .iter()
             .find(|device| device.device_type == DeviceType::NavStation)
             .expect("nav station");
-        assert!(interior
+        let front_y = nav.y + nav.h;
+        assert!(front_y < interior.ship.height);
+        for x in nav.x..nav.x + nav.w {
+            assert!(interior.ship.is_passable(x as i32, front_y as i32));
+        }
+    }
+
+    #[test]
+    fn bed_and_nav_use_two_tiles() {
+        let interior = InteriorWorld::new_test_ship();
+        let bed = interior
             .ship
-            .is_passable(nav.x as i32, nav.y as i32));
+            .devices
+            .iter()
+            .find(|device| device.device_type == DeviceType::BedDevice)
+            .expect("bed device");
+        assert_eq!((bed.w, bed.h), (2, 1));
+        for dx in 0..bed.w {
+            assert_eq!(interior.ship.tile_type(bed.x + dx, bed.y), TileType::Bed);
+        }
+        let nav = interior
+            .ship
+            .devices
+            .iter()
+            .find(|device| device.device_type == DeviceType::NavStation)
+            .expect("nav station");
+        assert_eq!((nav.w, nav.h), (2, 1));
+    }
+
+    #[test]
+    fn floor_tiles_expose_atmos_samples() {
+        let interior = InteriorWorld::new_test_ship();
+        assert!(interior.ship.tile_atmos_sample(1, 1).is_some());
+        assert!(interior.ship.tile_atmos_sample(0, 0).is_none());
     }
 }

@@ -44,6 +44,16 @@ COLORS = {
     "highlight": (182, 255, 201),
 }
 
+INTERACTIVE_MODAL_KINDS = {
+    "ReactorUranium",
+    "NavStation",
+    "Transponder",
+    "ShipComputer",
+    "Dispenser",
+    "FoodGenerator",
+    "DoorDevice",
+}
+
 MOVE_KEYS = {
     pygame.K_UP: (0, -1),
     pygame.K_DOWN: (0, 1),
@@ -67,6 +77,7 @@ class ViewerState:
         self.zoom: float = 1.0
         self.selected_device_id: Optional[int] = None
         self.modal_device_id: Optional[int] = None
+        self.context_tile: Optional[Tuple[int, int]] = None
 
 
 class ServerConnection:
@@ -213,6 +224,58 @@ def screen_to_tile(state: ViewerState, pos: Tuple[int, int]) -> Optional[Tuple[i
     return int(x), int(y)
 
 
+def parse_tile_entry(entry: Any) -> Tuple[str, Optional[Dict[str, Any]]]:
+    if isinstance(entry, dict):
+        tile_type = entry.get("type") or entry.get("tile_type") or "Empty"
+        return str(tile_type), entry.get("atmos")
+    if entry is None:
+        return "Empty", None
+    return str(entry), None
+
+
+def tile_info_at(interior: Dict, tx: int, ty: int) -> Optional[Dict[str, Any]]:
+    tiles = interior.get("tiles", [])
+    if ty < 0 or ty >= len(tiles):
+        return None
+    row = tiles[ty]
+    if tx < 0 or tx >= len(row):
+        return None
+    tile_type, atmos = parse_tile_entry(row[tx])
+    return {"type": tile_type, "atmos": atmos}
+
+
+def build_atmo_lines(atmos: Optional[Dict[str, Any]]) -> List[str]:
+    if not atmos:
+        return []
+    pressure = float(atmos.get("pressure_kpa", 0.0))
+    o2 = float(atmos.get("o2_fraction", 0.0)) * 100.0
+    n2 = float(atmos.get("n2_fraction", 0.0)) * 100.0
+    co2 = float(atmos.get("co2_fraction", 0.0)) * 100.0
+    return [
+        "Atmos:",
+        f"  P: {pressure:.1f} kPa",
+        f"  O2: {o2:.1f} %",
+        f"  N2: {n2:.1f} %",
+        f"  CO2: {co2:.1f} %",
+    ]
+
+
+def build_tile_context_lines(
+    tile_info: Dict[str, Any], pos: Tuple[int, int]
+) -> Tuple[List[str], str]:
+    tile_type = tile_info.get("type", "Empty")
+    lines = [f"Pos: ({pos[0]}, {pos[1]})"]
+    if tile_type == "Wall":
+        lines.append("Standard wall. No atmosphere sample.")
+        return lines, "Wall"
+    atmo_lines = build_atmo_lines(tile_info.get("atmos"))
+    if atmo_lines:
+        lines.extend(atmo_lines)
+    else:
+        lines.append("Atmos: n/a")
+    return lines, tile_type
+
+
 def handle_right_click(
     state: ViewerState, snapshot: Optional[Dict], pos: Tuple[int, int]
 ) -> None:
@@ -221,13 +284,17 @@ def handle_right_click(
     interior = snapshot.get("interior") or {}
     tile = screen_to_tile(state, pos)
     if tile is None:
+        state.context_tile = None
+        state.selected_device_id = None
         return
     width = interior.get("width", 0)
     height = interior.get("height", 0)
     tx, ty = tile
     if tx >= width or ty >= height:
+        state.context_tile = None
         state.selected_device_id = None
         return
+    state.context_tile = (tx, ty)
     device = find_device_at(interior, tx, ty)
     state.selected_device_id = device.get("id") if device else None
 
@@ -243,8 +310,9 @@ def handle_events(
             if event.key == pygame.K_ESCAPE:
                 if state.modal_device_id is not None:
                     state.modal_device_id = None
-                elif state.selected_device_id is not None:
+                elif state.selected_device_id is not None or state.context_tile is not None:
                     state.selected_device_id = None
+                    state.context_tile = None
                 else:
                     return False
                 modal_open = state.modal_device_id is not None
@@ -284,7 +352,8 @@ def draw_snapshot(screen: pygame.Surface, snapshot: Dict, state: ViewerState) ->
 
     tiles = interior.get("tiles", [])
     for y, row in enumerate(tiles):
-        for x, tile_name in enumerate(row):
+        for x, entry in enumerate(row):
+            tile_name, _ = parse_tile_entry(entry)
             rect = pygame.Rect(
                 offset_x + x * tile_size,
                 offset_y + y * tile_size,
@@ -379,24 +448,40 @@ def draw_pawn(
         return
     x = pawn.get("x", 0)
     y = pawn.get("y", 0)
-    rect = pygame.Rect(
-        offset_x + x * tile_size,
-        offset_y + y * tile_size,
-        tile_size,
-        tile_size,
-    )
-    inner = rect.inflate(-tile_size * 0.4, -tile_size * 0.4)
-    pygame.draw.rect(screen, COLORS["pawn"], inner)
+    cx = int(offset_x + (x + 0.5) * tile_size)
+    cy = int(offset_y + (y + 0.5) * tile_size)
+    body_radius = max(2, int(tile_size * 0.35))
+    head_radius = max(1, int(tile_size * 0.22))
+    arm_radius = max(1, int(tile_size * 0.18))
+    head_center = (cx, int(cy - tile_size * 0.25))
+    left_arm_center = (int(cx - tile_size * 0.25), cy)
+    right_arm_center = (int(cx + tile_size * 0.25), cy)
+    pygame.draw.circle(screen, COLORS["pawn"], (cx, cy), body_radius)
+    pygame.draw.circle(screen, COLORS["pawn"], head_center, head_radius)
+    pygame.draw.circle(screen, COLORS["pawn"], left_arm_center, arm_radius)
+    pygame.draw.circle(screen, COLORS["pawn"], right_arm_center, arm_radius)
 
 
 def draw_context_panel(screen: pygame.Surface, interior: Dict, state: ViewerState) -> None:
     if FONT_SMALL is None or FONT_MEDIUM is None:
         return
-    device = find_selected_device(interior, state.selected_device_id)
-    if not device:
+    if state.context_tile is None:
         return
-    lines = build_device_lines(device)
-    title = device.get("kind", "Device")
+    tx, ty = state.context_tile
+    tile_info = tile_info_at(interior, tx, ty)
+    if tile_info is None:
+        state.context_tile = None
+        state.selected_device_id = None
+        return
+    device = find_device_at(interior, tx, ty)
+    if device:
+        lines = build_device_lines(device)
+        atmo_lines = build_atmo_lines(tile_info.get("atmos"))
+        if atmo_lines:
+            lines += [""] + atmo_lines
+        title = device.get("kind", "Device")
+    else:
+        lines, title = build_tile_context_lines(tile_info, (tx, ty))
     draw_panel(
         screen,
         title,
@@ -489,8 +574,6 @@ def modal_action_specs(device: Dict) -> List[Tuple[int, str]]:
         specs.append((pygame.K_t, "[T] Toggle reactor"))
     elif kind == "Dispenser":
         specs.append((pygame.K_t, "[T] Toggle dispenser"))
-    elif kind == "Light":
-        specs.append((pygame.K_t, "[T] Toggle light"))
     elif kind == "DoorDevice":
         specs.append((pygame.K_t, "[T] Toggle door"))
     if kind == "FoodGenerator":
@@ -523,7 +606,7 @@ def try_open_modal(state: ViewerState, snapshot: Optional[Dict]) -> None:
         return
     interior = snapshot.get("interior") or {}
     device = find_device_near_pawn(interior)
-    if device:
+    if device and device_allows_modal(device):
         state.modal_device_id = device.get("id")
 
 def draw_pawn_panel(screen: pygame.Surface, interior: Dict) -> None:
@@ -622,6 +705,10 @@ def device_contains_tile(device: Dict, tx: int, ty: int) -> bool:
     w = device.get("w", 1)
     h = device.get("h", 1)
     return x <= tx < x + w and y <= ty < y + h
+
+
+def device_allows_modal(device: Dict) -> bool:
+    return device.get("kind") in INTERACTIVE_MODAL_KINDS
 
 
 def find_selected_device(interior: Dict, device_id: Optional[int]) -> Optional[Dict]:
@@ -762,6 +849,13 @@ def prune_selection(state: ViewerState, interior: Dict) -> None:
         interior, state.modal_device_id
     ):
         state.modal_device_id = None
+    if state.context_tile is not None:
+        tx, ty = state.context_tile
+        width = interior.get("width", 0)
+        height = interior.get("height", 0)
+        if tx >= width or ty >= height:
+            state.context_tile = None
+            state.selected_device_id = None
 
 
 def main() -> None:
