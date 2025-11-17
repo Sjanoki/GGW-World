@@ -2,7 +2,7 @@ use std::f64::consts::FRAC_PI_4;
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ggw_world::{
     BodyState, BodyType, OrbitState, Vec2, World, DESPAWN_RADIUS_M, GRAVITY_WELL_RADIUS_M,
@@ -12,6 +12,7 @@ use ggw_world::{
 const MU_EARTH: f64 = 3.986_004_418e14;
 const DEFAULT_DT_SECONDS: f64 = 10.0;
 const MAX_TIME_SCALE: f64 = 10_000.0;
+const MAX_SIM_DT: f64 = 1.0;
 const SNAPSHOT_SLEEP_MS: u64 = 50;
 
 fn main() {
@@ -57,13 +58,26 @@ fn main() {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     let mut time_scale = DEFAULT_DT_SECONDS;
+    let mut last_real = Instant::now();
 
     loop {
         if let Some(new_scale) = stdin_thread.try_recv_time_scale() {
             time_scale = new_scale;
         }
 
-        world.step(time_scale);
+        let now = Instant::now();
+        let real_dt = now.duration_since(last_real).as_secs_f64();
+        last_real = now;
+
+        let mut sim_dt = time_scale * real_dt;
+        if sim_dt > MAX_SIM_DT {
+            sim_dt = MAX_SIM_DT;
+        }
+        if sim_dt < 0.0 {
+            sim_dt = 0.0;
+        }
+
+        world.step(sim_dt);
         let snapshot_json = build_snapshot_json(&world);
         writeln!(handle, "{}", snapshot_json).expect("stdout write");
         handle.flush().expect("stdout flush");
