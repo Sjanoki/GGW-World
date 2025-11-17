@@ -392,7 +392,7 @@ impl ShipInterior {
         devices.push(Device {
             id: next_id,
             device_type: DeviceType::NavStation,
-            x: 8,
+            x: 7,
             y: 3,
             w: 1,
             h: 1,
@@ -961,5 +961,19 @@ mod tests {
             .filter(|device| device.device_type == DeviceType::NavStation)
             .count();
         assert_eq!(nav_count, 1);
+    }
+
+    #[test]
+    fn nav_station_tile_is_reachable() {
+        let interior = InteriorWorld::new_test_ship();
+        let nav = interior
+            .ship
+            .devices
+            .iter()
+            .find(|device| device.device_type == DeviceType::NavStation)
+            .expect("nav station");
+        assert!(interior
+            .ship
+            .is_passable(nav.x as i32, nav.y as i32));
     }
 }
