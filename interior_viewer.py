@@ -161,11 +161,23 @@ def ensure_layout(interior: Dict, state: ViewerState) -> None:
         tile_h = usable_h / height
         state.base_tile_size = max(8.0, min(tile_w, tile_h))
     tile_size = max(8, int(state.base_tile_size * state.zoom))
-    grid_w = tile_size * width
-    grid_h = tile_size * height
-    offset_x = (WINDOW_WIDTH - grid_w) // 2
-    offset_y = (WINDOW_HEIGHT - grid_h) // 2
     state.tile_size = tile_size
+
+
+def update_camera_follow(interior: Dict, state: ViewerState) -> None:
+    tile_size = state.tile_size
+    pawn = interior.get("pawn") or {}
+    width = interior.get("width", 1)
+    height = interior.get("height", 1)
+    px = pawn.get("x")
+    py = pawn.get("y")
+    if px is None or py is None:
+        px = max(0.0, width / 2.0 - 0.5)
+        py = max(0.0, height / 2.0 - 0.5)
+    center_x = (float(px) + 0.5) * tile_size
+    center_y = (float(py) + 0.5) * tile_size
+    offset_x = int(WINDOW_WIDTH / 2 - center_x)
+    offset_y = int(WINDOW_HEIGHT / 2 - center_y)
     state.offset = (offset_x, offset_y)
 
 
@@ -266,6 +278,7 @@ def draw_snapshot(screen: pygame.Surface, snapshot: Dict, state: ViewerState) ->
         return
 
     ensure_layout(interior, state)
+    update_camera_follow(interior, state)
     tile_size = state.tile_size
     offset_x, offset_y = state.offset
 
@@ -443,16 +456,16 @@ def build_modal_content(device: Dict, snapshot: Dict) -> Tuple[str, List[str], L
         status = "Online" if device.get("reactor_online") else "Offline"
         lines.append(f"Core state: {status}")
     elif kind == "NavStation":
-        ship = primary_ship_body(snapshot)
-        if ship:
-            altitude = max(
-                0.0,
-                math.hypot(ship.get("x", 0.0), ship.get("y", 0.0))
-                - snapshot.get("planet_radius_m", 0.0),
-            )
-            speed = math.hypot(ship.get("vx", 0.0), ship.get("vy", 0.0))
-            lines.append(f"Altitude: {altitude/1000:.1f} km")
-            lines.append(f"Velocity: {speed/1000:.2f} km/s")
+        nav = nav_stats(snapshot)
+        if nav:
+            lines.append(f"Alt: {format_distance(nav['altitude'])}")
+            lines.append(f"Ap: {format_distance(nav['apoapsis'])}")
+            lines.append(f"Pe: {format_distance(nav['periapsis'])}")
+            lines.append(f"Speed: {nav['speed'] / 1000:.2f} km/s")
+            lines.append(f"Period: {nav['period'] / 3600:.2f} h")
+            lines.append(f"Heading: {nav['heading']}")
+        else:
+            lines.append("Nav data unavailable")
     elif kind == "ShipComputer":
         total = len(snapshot.get("interior", {}).get("devices", []))
         lines.append(f"Devices linked: {total}")
@@ -639,6 +652,49 @@ def find_device_near_pawn(interior: Dict) -> Optional[Dict]:
     return best
 
 
+def nav_stats(snapshot: Dict) -> Optional[Dict[str, float]]:
+    ship = primary_ship_body(snapshot)
+    if not ship:
+        return None
+    mu = float(snapshot.get("mu", 0.0))
+    planet_radius = float(snapshot.get("planet_radius_m", 0.0))
+    if mu <= 0.0:
+        return None
+    x = float(ship.get("x", 0.0))
+    y = float(ship.get("y", 0.0))
+    vx = float(ship.get("vx", 0.0))
+    vy = float(ship.get("vy", 0.0))
+    r = math.hypot(x, y)
+    if r <= 0.0:
+        return None
+    speed = math.hypot(vx, vy)
+    dot_rv = x * vx + y * vy
+    e_vec_x = ((speed * speed - mu / r) * x - dot_rv * vx) / mu
+    e_vec_y = ((speed * speed - mu / r) * y - dot_rv * vy) / mu
+    eccentricity = math.hypot(e_vec_x, e_vec_y)
+    denom = 2.0 / r - (speed * speed) / mu
+    if abs(denom) < 1e-9:
+        return None
+    semi_major = 1.0 / denom
+    if semi_major <= 0.0:
+        return None
+    apoapsis = semi_major * (1.0 + eccentricity)
+    periapsis = semi_major * (1.0 - eccentricity)
+    altitude = max(0.0, r - planet_radius)
+    apo_alt = max(0.0, apoapsis - planet_radius)
+    peri_alt = max(0.0, periapsis - planet_radius)
+    period = 2.0 * math.pi * math.sqrt(semi_major ** 3 / mu)
+    heading = "Prograde" if x * vy - y * vx >= 0.0 else "Retrograde"
+    return {
+        "altitude": altitude,
+        "apoapsis": apo_alt,
+        "periapsis": peri_alt,
+        "speed": speed,
+        "period": period,
+        "heading": heading,
+    }
+
+
 def build_device_lines(device: Dict) -> List[str]:
     lines = [
         f"Pos: ({device.get('x', 0)}, {device.get('y', 0)})",
@@ -676,6 +732,16 @@ def primary_ship_body(snapshot: Dict) -> Optional[Dict]:
         if body.get("body_type") == "Ship":
             return body
     return None
+
+
+def format_distance(meters: float) -> str:
+    if meters < 1_000.0:
+        return f"{meters:.0f} m"
+    if meters < 1_000_000.0:
+        return f"{meters / 1_000.0:.2f} km"
+    if meters < 1_000_000_000.0:
+        return f"{meters / 1_000_000.0:.2f} Mm"
+    return f"{meters / 1_000_000_000.0:.2f} Gm"
 
 
 def draw_message(screen: pygame.Surface, message: str) -> None:

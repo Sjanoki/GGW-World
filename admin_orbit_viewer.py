@@ -19,6 +19,9 @@ PICK_RADIUS_PX = 12
 ZOOM_STEP = 1.1
 HUD_MARGIN = 12
 HULL_SHAPE_MIN_PX = 6
+MAX_ZOOM_PX_PER_M = 6.0
+SCALE_BAR_MIN_PX = 80
+SCALE_BAR_MAX_PX = 200
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 40000
 
@@ -182,7 +185,7 @@ def ensure_base_scale(snapshot: Dict, state: ViewerState) -> None:
     state.base_scale = base_scale
     state.zoom_factor = 1.0
     state.zoom_factor_min = 1e-4
-    max_zoom = max(state.zoom_factor_min, 1.0 / base_scale)
+    max_zoom = max(state.zoom_factor_min, MAX_ZOOM_PX_PER_M / base_scale)
     state.zoom_factor_max = max_zoom
     state.zoom_factor = clamp(state.zoom_factor, state.zoom_factor_min, state.zoom_factor_max)
     state.camera_center_world = [0.0, 0.0]
@@ -462,6 +465,7 @@ def draw_snapshot(
 
     draw_hud(screen, snapshot, state)
     draw_info_panel(screen, snapshot, state)
+    draw_scale_bar(screen, state)
 
     pygame.display.flip()
 
@@ -588,6 +592,56 @@ def draw_info_panel(screen: pygame.Surface, snapshot: Dict, state: ViewerState) 
         surface = FONT_SMALL.render(line, True, COLORS["fg_main"])
         screen.blit(surface, (rect.left + padding, y))
         y += body_height
+
+
+def draw_scale_bar(screen: pygame.Surface, state: ViewerState) -> None:
+    if FONT_SMALL is None or state.base_scale is None:
+        return
+    scale = state.base_scale * state.zoom_factor
+    if scale <= 0:
+        return
+    meters_per_px = 1.0 / scale
+    distance_m, px_len = choose_scale_bar_distance(meters_per_px)
+    if distance_m <= 0.0 or px_len <= 0.0:
+        return
+    width = max(1, int(px_len))
+    bar_height = 6
+    padding = HUD_MARGIN
+    rect = pygame.Rect(
+        WINDOW_WIDTH - padding - width,
+        WINDOW_HEIGHT - padding - bar_height - FONT_SMALL.get_linesize() - 6,
+        width,
+        bar_height,
+    )
+    pygame.draw.rect(screen, COLORS["fg_main"], rect, width=2)
+    label = format_distance(distance_m)
+    text_surface = FONT_SMALL.render(label, True, COLORS["fg_main"])
+    text_rect = text_surface.get_rect(midtop=(rect.centerx, rect.bottom + 4))
+    screen.blit(text_surface, text_rect)
+
+
+def choose_scale_bar_distance(meters_per_px: float) -> Tuple[float, float]:
+    if meters_per_px <= 0.0:
+        return 0.0, 0.0
+    target_px = (SCALE_BAR_MIN_PX + SCALE_BAR_MAX_PX) / 2.0
+    raw_distance = meters_per_px * target_px
+    if raw_distance <= 0.0:
+        raw_distance = meters_per_px
+    exponent = math.floor(math.log10(raw_distance)) if raw_distance > 0 else 0
+    best_distance = raw_distance
+    best_px = raw_distance / meters_per_px
+    for exp in range(exponent - 3, exponent + 4):
+        magnitude = 10.0 ** exp
+        for factor in (1.0, 2.0, 5.0):
+            candidate = factor * magnitude
+            px_len = candidate / meters_per_px
+            if SCALE_BAR_MIN_PX <= px_len <= SCALE_BAR_MAX_PX:
+                return candidate, px_len
+            if abs(px_len - target_px) < abs(best_px - target_px):
+                best_distance = candidate
+                best_px = px_len
+    clamped_px = clamp(best_px, SCALE_BAR_MIN_PX, SCALE_BAR_MAX_PX)
+    return meters_per_px * clamped_px, clamped_px
 
 
 def build_selection_info(snapshot: Dict, state: ViewerState) -> Optional[Tuple[str, List[str]]]:
