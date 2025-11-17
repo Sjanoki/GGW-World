@@ -91,6 +91,7 @@ pub enum DeviceData {
     Tank(TankData),
     Reactor(ReactorData),
     Dispenser(DispenserData),
+    NavStation(NavStationData),
     Transponder(TransponderData),
     ShipComputer(ShipComputerData),
     BedDevice(BedDeviceData),
@@ -127,6 +128,11 @@ pub struct DispenserData {
     pub rate_kg_per_s: f32,
     pub gas_type: GasType,
     pub connected_tank_id: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NavStationData {
+    pub online: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -380,6 +386,19 @@ impl ShipInterior {
                 callsign: "GGW-TEST".to_string(),
                 online: true,
             }),
+        });
+        next_id += 1;
+
+        devices.push(Device {
+            id: next_id,
+            device_type: DeviceType::NavStation,
+            x: 8,
+            y: 3,
+            w: 1,
+            h: 1,
+            power_kw: 1.5,
+            online: true,
+            data: DeviceData::NavStation(NavStationData { online: true }),
         });
         next_id += 1;
 
@@ -930,5 +949,17 @@ mod tests {
         interior.queue_command(InteriorCommand::InteractAt { x: 2, y: 2 });
         interior.step(0.0);
         assert_eq!(interior.pawn.status, PawnStatus::Sleeping);
+    }
+
+    #[test]
+    fn default_ship_has_one_nav_station() {
+        let interior = InteriorWorld::new_test_ship();
+        let nav_count = interior
+            .ship
+            .devices
+            .iter()
+            .filter(|device| device.device_type == DeviceType::NavStation)
+            .count();
+        assert_eq!(nav_count, 1);
     }
 }

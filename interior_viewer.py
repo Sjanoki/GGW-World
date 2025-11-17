@@ -362,6 +362,7 @@ def device_label(kind: str) -> str:
         "BedDevice": "BD",
         "Transponder": "TR",
         "ShipComputer": "SC",
+        "NavStation": "NV",
         "FoodGenerator": "FG",
     }
     return labels.get(kind, "")

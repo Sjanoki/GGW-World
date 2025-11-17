@@ -414,6 +414,12 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
                     if data.online { "true" } else { "false" }
                 ));
             }
+            DeviceData::NavStation(data) => {
+                json.push_str(&format!(
+                    ",\"nav_online\":{}",
+                    if data.online { "true" } else { "false" }
+                ));
+            }
             DeviceData::Transponder(data) => {
                 json.push_str(&format!(
                     ",\"callsign\":\"{}\",\"transponder_online\":{}",
