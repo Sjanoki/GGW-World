@@ -18,7 +18,7 @@ TRAIL_LENGTH = 300
 PICK_RADIUS_PX = 12
 ZOOM_STEP = 1.1
 HUD_MARGIN = 12
-HULL_SHAPE_MIN_PX = 18
+HULL_SHAPE_MIN_PX = 6
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 40000
 
@@ -501,7 +501,7 @@ def draw_body(
     if hull and radius_px >= HULL_SHAPE_MIN_PX:
         vertices = hull.get("vertices", [])
         if len(vertices) >= 3:
-            points = []
+            points: List[Tuple[int, int]] = []
             bx = body.get("x", 0.0)
             by = body.get("y", 0.0)
             for vertex in vertices:
@@ -511,11 +511,12 @@ def draw_body(
                     world_to_screen(wx, wy, cam_center, base_scale, zoom_factor)
                 )
             if len(points) >= 3:
-                pygame.draw.polygon(screen, color, points, width=0)
+                pygame.draw.polygon(screen, COLORS["planet_fill"], points)
+                pygame.draw.polygon(screen, color, points, width=2)
                 hull_drawn = True
                 if selected_id == body_id:
                     pygame.draw.polygon(
-                        screen, COLORS["fg_highlight"], points, width=2
+                        screen, COLORS["fg_highlight"], points, width=3
                     )
     sx, sy = world_to_screen(
         body.get("x", 0.0),

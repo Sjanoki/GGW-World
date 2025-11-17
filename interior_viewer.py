@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import socket
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -65,6 +66,7 @@ class ViewerState:
         self.offset: Tuple[int, int] = (0, 0)
         self.zoom: float = 1.0
         self.selected_device_id: Optional[int] = None
+        self.modal_device_id: Optional[int] = None
 
 
 class ServerConnection:
@@ -177,17 +179,15 @@ def send_toggle_sleep(conn: ServerConnection) -> None:
     conn.send_json(payload)
 
 
-def send_interact(conn: ServerConnection, snapshot: Optional[Dict]) -> None:
-    if not snapshot:
-        return
-    interior = snapshot.get("interior") or {}
-    pawn = interior.get("pawn") or {}
-    x = pawn.get("x")
-    y = pawn.get("y")
-    if x is None or y is None:
-        return
+def send_interact_at(conn: ServerConnection, x: int, y: int) -> None:
     payload = {"type": "interact_at", "x": int(x), "y": int(y)}
     conn.send_json(payload)
+
+
+def send_interact_device(conn: ServerConnection, device: Dict) -> None:
+    x = int(device.get("x", 0))
+    y = int(device.get("y", 0))
+    send_interact_at(conn, x, y)
 
 
 def screen_to_tile(state: ViewerState, pos: Tuple[int, int]) -> Optional[Tuple[int, int]]:
@@ -223,25 +223,33 @@ def handle_right_click(
 def handle_events(
     conn: ServerConnection, state: ViewerState, snapshot: Optional[Dict]
 ) -> bool:
+    modal_open = state.modal_device_id is not None
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             return False
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
-                if state.selected_device_id is not None:
+                if state.modal_device_id is not None:
+                    state.modal_device_id = None
+                elif state.selected_device_id is not None:
                     state.selected_device_id = None
                 else:
                     return False
-            if event.key in MOVE_KEYS:
+                modal_open = state.modal_device_id is not None
+            elif event.key == pygame.K_e and not modal_open:
+                try_open_modal(state, snapshot)
+                modal_open = state.modal_device_id is not None
+            elif modal_open and handle_modal_key(conn, state, snapshot, event.key):
+                continue
+            elif not modal_open and event.key in MOVE_KEYS:
                 dx, dy = MOVE_KEYS[event.key]
                 send_move_command(conn, dx, dy)
-            if event.key == pygame.K_SPACE:
+            elif not modal_open and event.key == pygame.K_SPACE:
                 send_toggle_sleep(conn)
-            if event.key == pygame.K_e:
-                send_interact(conn, snapshot)
         if event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 3:
-                handle_right_click(state, snapshot, event.pos)
+                if state.modal_device_id is None:
+                    handle_right_click(state, snapshot, event.pos)
             elif event.button == 4:
                 state.zoom = clamp(state.zoom * ZOOM_STEP, ZOOM_MIN, ZOOM_MAX)
             elif event.button == 5:
@@ -276,6 +284,7 @@ def draw_snapshot(screen: pygame.Surface, snapshot: Dict, state: ViewerState) ->
     draw_pawn(screen, interior.get("pawn"), tile_size, offset_x, offset_y)
     draw_context_panel(screen, interior, state)
     draw_pawn_panel(screen, interior)
+    draw_device_modal(screen, snapshot, state)
     pygame.display.flip()
 
 
@@ -320,6 +329,8 @@ def draw_devices(screen: pygame.Surface, devices: List[Dict], state: ViewerState
         pygame.draw.rect(screen, COLORS["grid"], rect, width=1)
         if state.selected_device_id == device.get("id"):
             pygame.draw.rect(screen, COLORS["highlight"], rect, width=2)
+        if state.modal_device_id == device.get("id"):
+            pygame.draw.rect(screen, COLORS["fg"], rect, width=2)
         if labels and FONT_SMALL is not None:
             code = device_label(kind)
             if code:
@@ -380,11 +391,133 @@ def draw_context_panel(screen: pygame.Surface, interior: Dict, state: ViewerStat
     )
 
 
+def draw_device_modal(screen: pygame.Surface, snapshot: Dict, state: ViewerState) -> None:
+    if state.modal_device_id is None or FONT_SMALL is None or FONT_MEDIUM is None:
+        return
+    interior = snapshot.get("interior") or {}
+    device = find_selected_device(interior, state.modal_device_id)
+    if not device:
+        state.modal_device_id = None
+        return
+    title, lines, action_lines = build_modal_content(device, snapshot)
+    overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 120))
+    screen.blit(overlay, (0, 0))
+    content_lines = lines + ([""] if lines and action_lines else []) + action_lines
+    width = max(
+        [FONT_MEDIUM.size(title)[0]]
+        + [FONT_SMALL.size(line)[0] for line in content_lines]
+    )
+    height = (
+        FONT_MEDIUM.get_linesize()
+        + len(content_lines) * FONT_SMALL.get_linesize()
+        + PANEL_PADDING * 2
+    )
+    panel_rect = pygame.Rect(
+        (WINDOW_WIDTH - (width + PANEL_PADDING * 2)) // 2,
+        (WINDOW_HEIGHT - height) // 2,
+        width + PANEL_PADDING * 2,
+        height,
+    )
+    pygame.draw.rect(screen, COLORS["hud_bg"], panel_rect)
+    pygame.draw.rect(screen, COLORS["hud_border"], panel_rect, width=2)
+    y = panel_rect.top + PANEL_PADDING
+    screen.blit(
+        FONT_MEDIUM.render(title, True, COLORS["fg"]),
+        (panel_rect.left + PANEL_PADDING, y),
+    )
+    y += FONT_MEDIUM.get_linesize()
+    for line in content_lines:
+        screen.blit(
+            FONT_SMALL.render(line, True, COLORS["fg"]),
+            (panel_rect.left + PANEL_PADDING, y),
+        )
+        y += FONT_SMALL.get_linesize()
+
+
+def build_modal_content(device: Dict, snapshot: Dict) -> Tuple[str, List[str], List[str]]:
+    title = device.get("kind", "Device")
+    lines = build_device_lines(device)
+    kind = device.get("kind", "")
+    if kind == "ReactorUranium":
+        status = "Online" if device.get("reactor_online") else "Offline"
+        lines.append(f"Core state: {status}")
+    elif kind == "NavStation":
+        ship = primary_ship_body(snapshot)
+        if ship:
+            altitude = max(
+                0.0,
+                math.hypot(ship.get("x", 0.0), ship.get("y", 0.0))
+                - snapshot.get("planet_radius_m", 0.0),
+            )
+            speed = math.hypot(ship.get("vx", 0.0), ship.get("vy", 0.0))
+            lines.append(f"Altitude: {altitude/1000:.1f} km")
+            lines.append(f"Velocity: {speed/1000:.2f} km/s")
+    elif kind == "ShipComputer":
+        total = len(snapshot.get("interior", {}).get("devices", []))
+        lines.append(f"Devices linked: {total}")
+    elif kind == "Transponder":
+        callsign = device.get("callsign", "N/A")
+        lines.append(f"Broadcast ID: {callsign}")
+
+    action_lines = [label for _, label in modal_action_specs(device)]
+    if action_lines:
+        action_lines.append("[ESC] Close")
+    else:
+        action_lines = ["[ESC] Close"]
+    return title, lines, action_lines
+
+
+def modal_action_specs(device: Dict) -> List[Tuple[int, str]]:
+    kind = device.get("kind")
+    specs: List[Tuple[int, str]] = []
+    if kind == "ReactorUranium":
+        specs.append((pygame.K_t, "[T] Toggle reactor"))
+    elif kind == "Dispenser":
+        specs.append((pygame.K_t, "[T] Toggle dispenser"))
+    elif kind == "Light":
+        specs.append((pygame.K_t, "[T] Toggle light"))
+    elif kind == "DoorDevice":
+        specs.append((pygame.K_t, "[T] Toggle door"))
+    if kind == "FoodGenerator":
+        specs.append((pygame.K_f, "[F] Eat meal"))
+    return specs
+
+
+def handle_modal_key(
+    conn: ServerConnection,
+    state: ViewerState,
+    snapshot: Optional[Dict],
+    key: int,
+) -> bool:
+    if state.modal_device_id is None or not snapshot:
+        return False
+    interior = snapshot.get("interior") or {}
+    device = find_selected_device(interior, state.modal_device_id)
+    if not device:
+        state.modal_device_id = None
+        return False
+    for action_key, _ in modal_action_specs(device):
+        if key == action_key:
+            send_interact_device(conn, device)
+            return True
+    return False
+
+
+def try_open_modal(state: ViewerState, snapshot: Optional[Dict]) -> None:
+    if not snapshot:
+        return
+    interior = snapshot.get("interior") or {}
+    device = find_device_near_pawn(interior)
+    if device:
+        state.modal_device_id = device.get("id")
+
 def draw_pawn_panel(screen: pygame.Surface, interior: Dict) -> None:
     if FONT_SMALL is None or FONT_MEDIUM is None:
         return
     pawn = interior.get("pawn", {})
     needs = pawn.get("needs", {})
+    health = (pawn.get("health") or {}).get("body_parts", [])
     lines = [
         f"Status: {pawn.get('status', 'Unknown')}",
         f"Hunger: {needs.get('hunger', 0.0) * 100:.0f}%",
@@ -392,27 +525,51 @@ def draw_pawn_panel(screen: pygame.Surface, interior: Dict) -> None:
         f"Rest: {needs.get('rest', 0.0) * 100:.0f}%",
         f"Net power: {interior.get('power', {}).get('net_kw', 0.0):.1f} kW",
     ]
-    rect = pygame.Rect(PANEL_PADDING, WINDOW_HEIGHT - 260, 320, 0)
-    draw_panel(screen, "Pawn", lines, rect)
-
-    health = (pawn.get("health") or {}).get("body_parts", [])
-    if not health or FONT_SMALL is None:
-        return
-    x = rect.left + PANEL_PADDING
-    y = rect.bottom - PANEL_PADDING + 10
-    for part in health:
-        name = part.get("name", "?")
-        hp = float(part.get("hp", 0.0))
-        max_hp = max(1.0, float(part.get("max_hp", 1.0)))
-        frac = clamp(hp / max_hp, 0.0, 1.0)
-        label = FONT_SMALL.render(name, True, COLORS["fg"])
-        screen.blit(label, (x, y))
-        bar_rect = pygame.Rect(x, y + FONT_SMALL.get_linesize() - 4, BAR_WIDTH, BAR_HEIGHT)
-        pygame.draw.rect(screen, COLORS["fg_dim"], bar_rect, width=1)
-        fill_rect = bar_rect.inflate(-2, -2)
-        fill_rect.width = int((BAR_WIDTH - 4) * frac)
-        pygame.draw.rect(screen, COLORS["fg"], fill_rect)
-        y += BAR_HEIGHT + FONT_SMALL.get_linesize()
+    line_height = FONT_SMALL.get_linesize()
+    label_widths = [FONT_SMALL.size(line)[0] for line in lines]
+    health_label_width = 0
+    if health:
+        health_label_width = max(FONT_SMALL.size(part.get("name", "?"))[0] for part in health)
+    panel_width = max(
+        label_widths + [health_label_width + BAR_WIDTH + 12 if health else 0]
+    )
+    panel_width += PANEL_PADDING * 2
+    text_height = len(lines) * line_height
+    health_section_height = 0
+    if health:
+        health_section_height = len(health) * (line_height + BAR_HEIGHT)
+    panel_height = text_height + health_section_height + PANEL_PADDING * 2 + (8 if health else 0)
+    panel_rect = pygame.Rect(
+        PANEL_PADDING,
+        WINDOW_HEIGHT - panel_height - PANEL_PADDING,
+        panel_width,
+        panel_height,
+    )
+    pygame.draw.rect(screen, COLORS["hud_bg"], panel_rect)
+    pygame.draw.rect(screen, COLORS["hud_border"], panel_rect, width=1)
+    y = panel_rect.top + PANEL_PADDING
+    for line in lines:
+        screen.blit(
+            FONT_SMALL.render(line, True, COLORS["fg"]),
+            (panel_rect.left + PANEL_PADDING, y),
+        )
+        y += line_height
+    if health:
+        y += 8
+        for part in health:
+            name = part.get("name", "?")
+            hp = float(part.get("hp", 0.0))
+            max_hp = max(1.0, float(part.get("max_hp", 1.0)))
+            frac = clamp(hp / max_hp, 0.0, 1.0)
+            label_surface = FONT_SMALL.render(name, True, COLORS["fg"])
+            screen.blit(label_surface, (panel_rect.left + PANEL_PADDING, y))
+            bar_x = panel_rect.left + PANEL_PADDING + health_label_width + 8
+            bar_rect = pygame.Rect(bar_x, y + line_height - BAR_HEIGHT, BAR_WIDTH, BAR_HEIGHT)
+            pygame.draw.rect(screen, COLORS["fg_dim"], bar_rect, width=1)
+            fill_rect = bar_rect.inflate(-2, -2)
+            fill_rect.width = int((BAR_WIDTH - 4) * frac)
+            pygame.draw.rect(screen, COLORS["fg"], fill_rect)
+            y += line_height
 
 
 def draw_panel(
@@ -440,13 +597,17 @@ def draw_panel(
 
 def find_device_at(interior: Dict, tx: int, ty: int) -> Optional[Dict]:
     for device in interior.get("devices", []):
-        x = device.get("x", 0)
-        y = device.get("y", 0)
-        w = device.get("w", 1)
-        h = device.get("h", 1)
-        if x <= tx < x + w and y <= ty < y + h:
+        if device_contains_tile(device, tx, ty):
             return device
     return None
+
+
+def device_contains_tile(device: Dict, tx: int, ty: int) -> bool:
+    x = device.get("x", 0)
+    y = device.get("y", 0)
+    w = device.get("w", 1)
+    h = device.get("h", 1)
+    return x <= tx < x + w and y <= ty < y + h
 
 
 def find_selected_device(interior: Dict, device_id: Optional[int]) -> Optional[Dict]:
@@ -456,6 +617,26 @@ def find_selected_device(interior: Dict, device_id: Optional[int]) -> Optional[D
         if device.get("id") == device_id:
             return device
     return None
+
+
+def find_device_near_pawn(interior: Dict) -> Optional[Dict]:
+    pawn = interior.get("pawn") or {}
+    px = pawn.get("x")
+    py = pawn.get("y")
+    if px is None or py is None:
+        return None
+    best: Optional[Dict] = None
+    best_dist = 999
+    for device in interior.get("devices", []):
+        for ty in range(int(device.get("y", 0)), int(device.get("y", 0)) + int(device.get("h", 1))):
+            for tx in range(int(device.get("x", 0)), int(device.get("x", 0)) + int(device.get("w", 1))):
+                dist = max(abs(int(px) - tx), abs(int(py) - ty))
+                if dist <= 1 and dist < best_dist:
+                    best = device
+                    best_dist = dist
+        if best_dist == 0:
+            break
+    return best
 
 
 def build_device_lines(device: Dict) -> List[str]:
@@ -490,6 +671,13 @@ def build_device_lines(device: Dict) -> List[str]:
     return lines
 
 
+def primary_ship_body(snapshot: Dict) -> Optional[Dict]:
+    for body in snapshot.get("bodies", []):
+        if body.get("body_type") == "Ship":
+            return body
+    return None
+
+
 def draw_message(screen: pygame.Surface, message: str) -> None:
     if FONT_MEDIUM is None:
         return
@@ -499,10 +687,14 @@ def draw_message(screen: pygame.Surface, message: str) -> None:
 
 
 def prune_selection(state: ViewerState, interior: Dict) -> None:
-    if state.selected_device_id is None:
-        return
-    if not find_selected_device(interior, state.selected_device_id):
+    if state.selected_device_id is not None and not find_selected_device(
+        interior, state.selected_device_id
+    ):
         state.selected_device_id = None
+    if state.modal_device_id is not None and not find_selected_device(
+        interior, state.modal_device_id
+    ):
+        state.modal_device_id = None
 
 
 def main() -> None:
