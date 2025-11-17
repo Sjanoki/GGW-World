@@ -1,5 +1,6 @@
 use std::f64::consts::FRAC_PI_4;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -9,7 +10,8 @@ use ggw_world::{
 };
 
 const MU_EARTH: f64 = 3.986_004_418e14;
-const DT_SECONDS: f64 = 10.0;
+const DEFAULT_DT_SECONDS: f64 = 10.0;
+const MAX_TIME_SCALE: f64 = 10_000.0;
 const SNAPSHOT_SLEEP_MS: u64 = 50;
 
 fn main() {
@@ -51,16 +53,62 @@ fn main() {
     // Prime cached position/velocity fields.
     world.step(0.0);
 
+    let stdin_thread = spawn_command_listener();
     let stdout = io::stdout();
     let mut handle = stdout.lock();
+    let mut time_scale = DEFAULT_DT_SECONDS;
 
     loop {
-        world.step(DT_SECONDS);
+        if let Some(new_scale) = stdin_thread.try_recv_time_scale() {
+            time_scale = new_scale;
+        }
+
+        world.step(time_scale);
         let snapshot_json = build_snapshot_json(&world);
         writeln!(handle, "{}", snapshot_json).expect("stdout write");
         handle.flush().expect("stdout flush");
         thread::sleep(Duration::from_millis(SNAPSHOT_SLEEP_MS));
     }
+}
+
+struct CommandListener {
+    receiver: mpsc::Receiver<String>,
+}
+
+impl CommandListener {
+    fn try_recv_time_scale(&self) -> Option<f64> {
+        use std::sync::mpsc::TryRecvError;
+        let mut latest: Option<f64> = None;
+        loop {
+            match self.receiver.try_recv() {
+                Ok(line) => {
+                    if let Some(scale) = parse_time_scale_command(&line) {
+                        latest = Some(scale);
+                    }
+                }
+                Err(TryRecvError::Empty) => return latest,
+                Err(TryRecvError::Disconnected) => return latest,
+            }
+        }
+    }
+}
+
+fn spawn_command_listener() -> CommandListener {
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    CommandListener { receiver: rx }
 }
 
 fn sample_body(id: u64, body_type: BodyType, orbit: OrbitState, radius: f64) -> BodyState {
@@ -109,5 +157,33 @@ fn body_type_name(body_type: BodyType) -> &'static str {
         BodyType::Asteroid => "Asteroid",
         BodyType::Debris => "Debris",
         BodyType::Missile => "Missile",
+    }
+}
+
+fn parse_time_scale_command(line: &str) -> Option<f64> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') || !trimmed.contains("set_time_scale") {
+        return None;
+    }
+    let key = "\"time_scale\"";
+    let start = trimmed.find(key)? + key.len();
+    let after_key = trimmed.get(start..)?;
+    let colon_index = after_key.find(':')?;
+    let after_colon = after_key.get(colon_index + 1..)?.trim_start();
+    let end_index = after_colon
+        .find(|c: char| c == ',' || c == '}')
+        .unwrap_or(after_colon.len());
+    let value_str = after_colon[..end_index].trim();
+    value_str
+        .parse::<f64>()
+        .ok()
+        .map(|value| clamp_time_scale(value))
+}
+
+fn clamp_time_scale(value: f64) -> f64 {
+    if value.is_nan() {
+        DEFAULT_DT_SECONDS
+    } else {
+        value.max(0.0).min(MAX_TIME_SCALE)
     }
 }
