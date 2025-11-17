@@ -4,10 +4,9 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
-from typing import Dict, List, Optional, Sequence, Tuple
+import socket
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pygame
 
@@ -23,6 +22,8 @@ ZOOM_MAX = 4.0
 BAR_WIDTH = 140
 BAR_HEIGHT = 10
 PANEL_PADDING = 12
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 40000
 
 COLORS = {
     "bg": (2, 5, 3),
@@ -66,26 +67,71 @@ class ViewerState:
         self.selected_device_id: Optional[int] = None
 
 
-def server_binary_path() -> str:
-    exe = "ggw_world.exe" if os.name == "nt" else "ggw_world"
-    path = os.path.join("target", "debug", exe)
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Binary '{path}' not found. Run 'cargo build --bin ggw_world' first."
-        )
-    return path
+class ServerConnection:
+    def __init__(self) -> None:
+        self.addr = (SERVER_HOST, SERVER_PORT)
+        self.sock: Optional[socket.socket] = None
+        self.sock_file = None
+        self.connect()
 
+    def connect(self) -> None:
+        while True:
+            try:
+                sock = socket.create_connection(self.addr)
+            except OSError:
+                print(
+                    "Could not connect to GGW server at 127.0.0.1:40000, retrying...",
+                    flush=True,
+                )
+                time.sleep(1.0)
+                continue
+            self.sock = sock
+            self.sock_file = sock.makefile("r", encoding="utf-8")
+            print("Connected to GGW server.", flush=True)
+            break
 
-def launch_server() -> subprocess.Popen:
-    path = server_binary_path()
-    return subprocess.Popen(
-        [path],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
+    def close(self) -> None:
+        if self.sock_file is not None:
+            try:
+                self.sock_file.close()
+            except OSError:
+                pass
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.sock_file = None
+
+    def readline(self) -> str:
+        while True:
+            if self.sock_file is None:
+                self.connect()
+                continue
+            try:
+                line = self.sock_file.readline()
+            except OSError:
+                self.close()
+                continue
+            if line == "":
+                print("Connection to GGW server lost, reconnecting...", flush=True)
+                self.close()
+                continue
+            return line
+
+    def send_json(self, payload: Dict[str, Any]) -> None:
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        while True:
+            if self.sock is None:
+                self.connect()
+            try:
+                assert self.sock is not None
+                self.sock.sendall(data)
+                return
+            except OSError:
+                print("Send failed, reconnecting to GGW server...", flush=True)
+                self.close()
 
 
 def init_pygame() -> pygame.Surface:
@@ -121,30 +167,18 @@ def ensure_layout(interior: Dict, state: ViewerState) -> None:
     state.offset = (offset_x, offset_y)
 
 
-def send_move_command(server: subprocess.Popen, dx: int, dy: int) -> None:
-    if server.stdin is None:
-        return
+def send_move_command(conn: ServerConnection, dx: int, dy: int) -> None:
     payload = {"type": "move_pawn", "dx": dx, "dy": dy}
-    try:
-        server.stdin.write(json.dumps(payload) + "\n")
-        server.stdin.flush()
-    except BrokenPipeError:
-        pass
+    conn.send_json(payload)
 
 
-def send_toggle_sleep(server: subprocess.Popen) -> None:
-    if server.stdin is None:
-        return
+def send_toggle_sleep(conn: ServerConnection) -> None:
     payload = {"type": "toggle_sleep"}
-    try:
-        server.stdin.write(json.dumps(payload) + "\n")
-        server.stdin.flush()
-    except BrokenPipeError:
-        pass
+    conn.send_json(payload)
 
 
-def send_interact(server: subprocess.Popen, snapshot: Optional[Dict]) -> None:
-    if server.stdin is None or not snapshot:
+def send_interact(conn: ServerConnection, snapshot: Optional[Dict]) -> None:
+    if not snapshot:
         return
     interior = snapshot.get("interior") or {}
     pawn = interior.get("pawn") or {}
@@ -153,11 +187,7 @@ def send_interact(server: subprocess.Popen, snapshot: Optional[Dict]) -> None:
     if x is None or y is None:
         return
     payload = {"type": "interact_at", "x": int(x), "y": int(y)}
-    try:
-        server.stdin.write(json.dumps(payload) + "\n")
-        server.stdin.flush()
-    except BrokenPipeError:
-        pass
+    conn.send_json(payload)
 
 
 def screen_to_tile(state: ViewerState, pos: Tuple[int, int]) -> Optional[Tuple[int, int]]:
@@ -191,7 +221,7 @@ def handle_right_click(
 
 
 def handle_events(
-    server: subprocess.Popen, state: ViewerState, snapshot: Optional[Dict]
+    conn: ServerConnection, state: ViewerState, snapshot: Optional[Dict]
 ) -> bool:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -204,11 +234,11 @@ def handle_events(
                     return False
             if event.key in MOVE_KEYS:
                 dx, dy = MOVE_KEYS[event.key]
-                send_move_command(server, dx, dy)
+                send_move_command(conn, dx, dy)
             if event.key == pygame.K_SPACE:
-                send_toggle_sleep(server)
+                send_toggle_sleep(conn)
             if event.key == pygame.K_e:
-                send_interact(server, snapshot)
+                send_interact(conn, snapshot)
         if event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 3:
                 handle_right_click(state, snapshot, event.pos)
@@ -476,20 +506,17 @@ def prune_selection(state: ViewerState, interior: Dict) -> None:
 
 
 def main() -> None:
-    server = launch_server()
     screen = init_pygame()
+    conn = ServerConnection()
     state = ViewerState()
     snapshot: Optional[Dict] = None
 
     try:
         while True:
-            if not handle_events(server, state, snapshot):
+            if not handle_events(conn, state, snapshot):
                 break
 
-            line = server.stdout.readline() if server.stdout else ""
-            if line == "":
-                break
-            line = line.strip()
+            line = conn.readline().strip()
             if not line:
                 continue
 
@@ -501,18 +528,9 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        if server.poll() is None:
-            server.terminate()
-            try:
-                server.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                server.kill()
+        conn.close()
         pygame.quit()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except FileNotFoundError as exc:
-        print(exc)
-        sys.exit(1)
+    main()

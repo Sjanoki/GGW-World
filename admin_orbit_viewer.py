@@ -5,11 +5,10 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import subprocess
-import sys
+import socket
+import time
 from collections import defaultdict, deque
-from typing import Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pygame
 
@@ -20,6 +19,8 @@ PICK_RADIUS_PX = 12
 ZOOM_STEP = 1.1
 HUD_MARGIN = 12
 HULL_SHAPE_MIN_PX = 18
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 40000
 
 # CRT-inspired styling
 COLORS = {
@@ -66,34 +67,82 @@ class ViewerState:
         self.zoom_factor_min: float = 1e-4
         self.zoom_factor_max: Optional[float] = None
         self.camera_center_world: List[float] = [0.0, 0.0]
+        self.camera_follow: bool = False
+        self.camera_offset: List[float] = [0.0, 0.0]
         self.is_panning: bool = False
         self.pan_start_mouse: Tuple[int, int] = (0, 0)
         self.pan_start_center: Tuple[float, float] = (0.0, 0.0)
+        self.pan_start_offset: Tuple[float, float] = (0.0, 0.0)
         self.selected_id: Optional[int] = None
         self.selected_planet: bool = False
-        self.sim_speed: float = 10.0
+        self.sim_speed: float = 1.0
 
 
-def server_binary_path() -> str:
-    exe = "ggw_world.exe" if os.name == "nt" else "ggw_world"
-    path = os.path.join("target", "debug", exe)
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Binary '{path}' not found. Run 'cargo build --bin ggw_world' first."
-        )
-    return path
+class ServerConnection:
+    def __init__(self) -> None:
+        self.addr = (SERVER_HOST, SERVER_PORT)
+        self.sock: Optional[socket.socket] = None
+        self.sock_file = None
+        self.connect()
 
+    def connect(self) -> None:
+        while True:
+            try:
+                sock = socket.create_connection(self.addr)
+            except OSError:
+                print(
+                    "Could not connect to GGW server at 127.0.0.1:40000, retrying...",
+                    flush=True,
+                )
+                time.sleep(1.0)
+                continue
+            self.sock = sock
+            self.sock_file = sock.makefile("r", encoding="utf-8")
+            print("Connected to GGW server.", flush=True)
+            break
 
-def launch_server() -> subprocess.Popen:
-    path = server_binary_path()
-    return subprocess.Popen(
-        [path],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
+    def close(self) -> None:
+        if self.sock_file is not None:
+            try:
+                self.sock_file.close()
+            except OSError:
+                pass
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.sock_file = None
+
+    def readline(self) -> str:
+        while True:
+            if self.sock_file is None:
+                self.connect()
+                continue
+            try:
+                line = self.sock_file.readline()
+            except OSError:
+                self.close()
+                continue
+            if line == "":
+                print("Connection to GGW server lost, reconnecting...", flush=True)
+                self.close()
+                continue
+            return line
+
+    def send_json(self, payload: Dict[str, Any]) -> None:
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        while True:
+            if self.sock is None:
+                self.connect()
+            try:
+                assert self.sock is not None
+                self.sock.sendall(data)
+                return
+            except OSError:
+                print("Send failed, reconnecting to GGW server...", flush=True)
+                self.close()
 
 
 def init_pygame() -> pygame.Surface:
@@ -186,30 +235,44 @@ def update_trails(trails: Dict[int, Deque[Tuple[float, float]]], snapshot: Dict)
             trail.popleft()
 
 
-def prune_trails(trails: Dict[int, Deque[Tuple[float, float]]], current_ids: Iterable[int]) -> None:
+def update_camera_center(snapshot: Dict, state: ViewerState) -> None:
+    if not state.camera_follow or state.selected_id is None:
+        return
+    body = find_body_by_id(snapshot, state.selected_id)
+    if body is None:
+        state.camera_follow = False
+        return
+    state.camera_center_world[0] = body.get("x", 0.0) + state.camera_offset[0]
+    state.camera_center_world[1] = body.get("y", 0.0) + state.camera_offset[1]
+
+
+def prune_trails(
+    trails: Dict[int, Deque[Tuple[float, float]]],
+    current_ids: Iterable[int],
+    state: ViewerState,
+) -> None:
     valid = set(current_ids)
     for body_id in list(trails.keys()):
         if body_id not in valid:
             del trails[body_id]
+    if state.selected_id is not None and state.selected_id not in valid:
+        state.selected_id = None
+        state.camera_follow = False
+        state.camera_offset = [0.0, 0.0]
 
 
-def send_time_scale_command(server: subprocess.Popen, time_scale: float) -> None:
-    if server.stdin is None:
-        return
-    try:
-        payload = json.dumps({"type": "set_time_scale", "time_scale": time_scale})
-        server.stdin.write(payload + "\n")
-        server.stdin.flush()
-    except (BrokenPipeError, OSError):
-        pass
+def send_time_scale_command(conn: ServerConnection, time_scale: float) -> None:
+    conn.send_json({"type": "set_time_scale", "time_scale": time_scale})
 
 
-def set_sim_speed(server: subprocess.Popen, state: ViewerState, new_speed: float) -> None:
+def set_sim_speed(conn: ServerConnection, state: ViewerState, new_speed: float) -> None:
     state.sim_speed = new_speed
-    send_time_scale_command(server, new_speed)
+    send_time_scale_command(conn, new_speed)
 
 
-def handle_events(snapshot: Optional[Dict], state: ViewerState, server: subprocess.Popen) -> bool:
+def handle_events(
+    snapshot: Optional[Dict], state: ViewerState, conn: ServerConnection
+) -> bool:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             return False
@@ -217,7 +280,7 @@ def handle_events(snapshot: Optional[Dict], state: ViewerState, server: subproce
             if event.key == pygame.K_ESCAPE:
                 return False
             if event.key in SIM_SPEED_KEYS:
-                set_sim_speed(server, state, SIM_SPEED_KEYS[event.key])
+                set_sim_speed(conn, state, SIM_SPEED_KEYS[event.key])
         if event.type == pygame.MOUSEWHEEL and state.base_scale is not None:
             if event.y > 0:
                 state.zoom_factor *= ZOOM_STEP
@@ -228,9 +291,11 @@ def handle_events(snapshot: Optional[Dict], state: ViewerState, server: subproce
                 state.zoom_factor = min(state.zoom_factor, state.zoom_factor_max)
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if not attempt_selection(snapshot, state, event.pos):
+                clear_selection(state)
                 state.is_panning = True
                 state.pan_start_mouse = event.pos
                 state.pan_start_center = tuple(state.camera_center_world)
+                state.pan_start_offset = tuple(state.camera_offset)
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             state.is_panning = False
         if event.type == pygame.MOUSEMOTION and state.is_panning and state.base_scale is not None:
@@ -238,8 +303,16 @@ def handle_events(snapshot: Optional[Dict], state: ViewerState, server: subproce
             if scale > 0.0:
                 dx = event.pos[0] - state.pan_start_mouse[0]
                 dy = event.pos[1] - state.pan_start_mouse[1]
-                state.camera_center_world[0] = state.pan_start_center[0] - dx / scale
-                state.camera_center_world[1] = state.pan_start_center[1] + dy / scale
+                if state.camera_follow:
+                    state.camera_offset[0] = state.pan_start_offset[0] - dx / scale
+                    state.camera_offset[1] = state.pan_start_offset[1] + dy / scale
+                else:
+                    state.camera_center_world[0] = (
+                        state.pan_start_center[0] - dx / scale
+                    )
+                    state.camera_center_world[1] = (
+                        state.pan_start_center[1] + dy / scale
+                    )
     return True
 
 
@@ -266,6 +339,20 @@ def find_body_under_cursor(
     return best_id
 
 
+def find_body_by_id(snapshot: Dict, body_id: int) -> Optional[Dict]:
+    for body in snapshot.get("bodies", []):
+        if body.get("id") == body_id:
+            return body
+    return None
+
+
+def clear_selection(state: ViewerState) -> None:
+    state.selected_planet = False
+    state.selected_id = None
+    state.camera_follow = False
+    state.camera_offset = [0.0, 0.0]
+
+
 def attempt_selection(snapshot: Optional[Dict], state: ViewerState, mouse_pos: Tuple[int, int]) -> bool:
     if snapshot is None or state.base_scale is None:
         return False
@@ -282,15 +369,26 @@ def attempt_selection(snapshot: Optional[Dict], state: ViewerState, mouse_pos: T
     if planet_radius > 0.0 and distance <= planet_radius * 1.02:
         state.selected_planet = True
         state.selected_id = None
+        state.camera_follow = False
+        state.camera_offset = [0.0, 0.0]
+        state.camera_center_world = [0.0, 0.0]
         state.is_panning = False
         return True
 
     body_id = find_body_under_cursor(snapshot, mouse_pos, state)
     if body_id is not None:
-        state.selected_planet = False
-        state.selected_id = body_id
-        state.is_panning = False
-        return True
+        body = find_body_by_id(snapshot, body_id)
+        if body is not None:
+            state.selected_planet = False
+            state.selected_id = body_id
+            state.camera_follow = True
+            state.camera_offset = [0.0, 0.0]
+            state.camera_center_world = [
+                body.get("x", 0.0),
+                body.get("y", 0.0),
+            ]
+            state.is_panning = False
+            return True
     return False
 
 
@@ -545,8 +643,8 @@ def build_selection_info(snapshot: Dict, state: ViewerState) -> Optional[Tuple[s
 
 
 def main() -> None:
-    server = launch_server()
     screen = init_pygame()
+    conn = ServerConnection()
     trails: Dict[int, Deque[Tuple[float, float]]] = defaultdict(
         lambda: deque(maxlen=TRAIL_LENGTH)
     )
@@ -555,12 +653,10 @@ def main() -> None:
 
     try:
         while True:
-            if not handle_events(snapshot, state, server):
+            if not handle_events(snapshot, state, conn):
                 break
 
-            line = server.stdout.readline() if server.stdout else ""
-            if line == "":
-                break
+            line = conn.readline()
             line = line.strip()
             if not line:
                 continue
@@ -569,27 +665,17 @@ def main() -> None:
             ensure_base_scale(snapshot, state)
 
             current_ids = {body["id"] for body in snapshot.get("bodies", [])}
-            prune_trails(trails, current_ids)
-            if state.selected_id is not None and state.selected_id not in current_ids:
-                state.selected_id = None
+            prune_trails(trails, current_ids, state)
 
             update_trails(trails, snapshot)
+            update_camera_center(snapshot, state)
             draw_snapshot(screen, snapshot, trails, state)
     except KeyboardInterrupt:
         pass
     finally:
-        if server.poll() is None:
-            server.terminate()
-            try:
-                server.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                server.kill()
+        conn.close()
         pygame.quit()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except FileNotFoundError as exc:
-        print(exc)
-        sys.exit(1)
+    main()

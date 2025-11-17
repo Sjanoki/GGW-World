@@ -1,5 +1,7 @@
+use std::env;
 use std::f64::consts::FRAC_PI_4;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,12 +13,132 @@ use ggw_world::{
 };
 
 const MU_EARTH: f64 = 3.986_004_418e14;
-const DEFAULT_DT_SECONDS: f64 = 10.0;
+const DEFAULT_TIME_SCALE: f64 = 1.0;
 const MAX_TIME_SCALE: f64 = 10_000.0;
 const MAX_SIM_DT: f64 = 1.0;
 const SNAPSHOT_SLEEP_MS: u64 = 50;
-
+const SERVER_ADDR: &str = "127.0.0.1:40000";
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|arg| arg == "--stdio") {
+        run_stdio_mode();
+    } else {
+        run_tcp_server();
+    }
+}
+
+fn run_stdio_mode() {
+    let mut world = build_initial_world();
+    let stdin_thread = spawn_command_listener();
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    let mut time_scale = DEFAULT_TIME_SCALE;
+    let mut last_real = Instant::now();
+
+    loop {
+        for command in stdin_thread.drain_commands() {
+            apply_command(&mut world, command, &mut time_scale);
+        }
+
+        let snapshot_json = tick_world(&mut world, time_scale, &mut last_real);
+        writeln!(handle, "{}", snapshot_json).expect("stdout write");
+        handle.flush().expect("stdout flush");
+        thread::sleep(Duration::from_millis(SNAPSHOT_SLEEP_MS));
+    }
+}
+
+fn run_tcp_server() {
+    let listener = TcpListener::bind(SERVER_ADDR).expect("failed to bind TCP listener");
+    println!("GGW server listening on {}", SERVER_ADDR);
+
+    let mut world = build_initial_world();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+    let (new_client_tx, new_client_rx) = mpsc::channel::<mpsc::Sender<String>>();
+
+    let accept_cmd_tx = cmd_tx.clone();
+    thread::spawn(move || accept_clients(listener, accept_cmd_tx, new_client_tx));
+
+    let mut clients: Vec<mpsc::Sender<String>> = Vec::new();
+    let mut time_scale = DEFAULT_TIME_SCALE;
+    let mut last_real = Instant::now();
+
+    loop {
+        while let Ok(new_client) = new_client_rx.try_recv() {
+            clients.push(new_client);
+        }
+
+        while let Ok(command) = cmd_rx.try_recv() {
+            apply_command(&mut world, command, &mut time_scale);
+        }
+
+        let snapshot_json = tick_world(&mut world, time_scale, &mut last_real);
+        clients.retain(|sender| sender.send(snapshot_json.clone()).is_ok());
+        thread::sleep(Duration::from_millis(SNAPSHOT_SLEEP_MS));
+    }
+}
+
+fn accept_clients(
+    listener: TcpListener,
+    cmd_tx: mpsc::Sender<Command>,
+    new_client_tx: mpsc::Sender<mpsc::Sender<String>>,
+) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let sender = spawn_client_connection(stream, cmd_tx.clone());
+                if new_client_tx.send(sender).is_err() {
+                    break;
+                }
+            }
+            Err(err) => {
+                eprintln!("Failed to accept client: {}", err);
+            }
+        }
+    }
+}
+
+fn spawn_client_connection(
+    stream: TcpStream,
+    cmd_tx: mpsc::Sender<Command>,
+) -> mpsc::Sender<String> {
+    let (snapshot_tx, snapshot_rx) = mpsc::channel::<String>();
+
+    let reader_stream = stream
+        .try_clone()
+        .expect("failed to clone stream for reader");
+    let reader_cmd_tx = cmd_tx.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(reader_stream);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if let Some(command) = parse_command(&line) {
+                        if reader_cmd_tx.send(command).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    thread::spawn(move || {
+        let mut writer = BufWriter::new(stream);
+        while let Ok(snapshot) = snapshot_rx.recv() {
+            if writeln!(writer, "{}", snapshot).is_err() {
+                break;
+            }
+            if writer.flush().is_err() {
+                break;
+            }
+        }
+    });
+
+    snapshot_tx
+}
+
+fn build_initial_world() -> World {
     let mut world = World::new(MU_EARTH);
     let r_planet = PLANET_RADIUS_M;
 
@@ -65,54 +187,45 @@ fn main() {
     ));
     world.add_body(sample_body(3, BodyType::Debris, debris_orbit, 10.0, None));
 
-    // Prime cached position/velocity fields.
     world.step(0.0);
+    world
+}
 
-    let stdin_thread = spawn_command_listener();
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    let mut time_scale = DEFAULT_DT_SECONDS;
-    let mut last_real = Instant::now();
+fn tick_world(world: &mut World, time_scale: f64, last_real: &mut Instant) -> String {
+    let now = Instant::now();
+    let real_dt = now.duration_since(*last_real).as_secs_f64();
+    *last_real = now;
 
-    loop {
-        for command in stdin_thread.drain_commands() {
-            match command {
-                Command::SetTimeScale(scale) => {
-                    time_scale = scale;
-                }
-                Command::MovePawn { dx, dy } => {
-                    world
-                        .interior
-                        .queue_command(InteriorCommand::MovePawn { dx, dy });
-                }
-                Command::ToggleSleep => {
-                    world.interior.queue_command(InteriorCommand::ToggleSleep);
-                }
-                Command::InteractAt { x, y } => {
-                    world
-                        .interior
-                        .queue_command(InteriorCommand::InteractAt { x, y });
-                }
-            }
+    let mut sim_dt = time_scale * real_dt;
+    if sim_dt > MAX_SIM_DT {
+        sim_dt = MAX_SIM_DT;
+    }
+    if sim_dt < 0.0 {
+        sim_dt = 0.0;
+    }
+
+    world.step(sim_dt);
+    build_snapshot_json(world)
+}
+
+fn apply_command(world: &mut World, command: Command, time_scale: &mut f64) {
+    match command {
+        Command::SetTimeScale(scale) => {
+            *time_scale = scale;
         }
-
-        let now = Instant::now();
-        let real_dt = now.duration_since(last_real).as_secs_f64();
-        last_real = now;
-
-        let mut sim_dt = time_scale * real_dt;
-        if sim_dt > MAX_SIM_DT {
-            sim_dt = MAX_SIM_DT;
+        Command::MovePawn { dx, dy } => {
+            world
+                .interior
+                .queue_command(InteriorCommand::MovePawn { dx, dy });
         }
-        if sim_dt < 0.0 {
-            sim_dt = 0.0;
+        Command::ToggleSleep => {
+            world.interior.queue_command(InteriorCommand::ToggleSleep);
         }
-
-        world.step(sim_dt);
-        let snapshot_json = build_snapshot_json(&world);
-        writeln!(handle, "{}", snapshot_json).expect("stdout write");
-        handle.flush().expect("stdout flush");
-        thread::sleep(Duration::from_millis(SNAPSHOT_SLEEP_MS));
+        Command::InteractAt { x, y } => {
+            world
+                .interior
+                .queue_command(InteriorCommand::InteractAt { x, y });
+        }
     }
 }
 
@@ -424,7 +537,7 @@ fn parse_time_scale_command(line: &str) -> Option<f64> {
 
 fn clamp_time_scale(value: f64) -> f64 {
     if value.is_nan() {
-        DEFAULT_DT_SECONDS
+        DEFAULT_TIME_SCALE
     } else {
         value.max(0.0).min(MAX_TIME_SCALE)
     }
