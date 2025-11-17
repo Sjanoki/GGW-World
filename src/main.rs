@@ -5,9 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ggw_world::{
-    interior::{InteriorCommand, InteriorWorld},
-    BodyState, BodyType, OrbitState, Vec2, World, DESPAWN_RADIUS_M, GRAVITY_WELL_RADIUS_M,
-    PLANET_RADIUS_M,
+    interior::{DeviceData, GasType, InteriorCommand, InteriorWorld},
+    BodyState, BodyType, HullShape, OrbitState, Vec2, World, DESPAWN_RADIUS_M,
+    GRAVITY_WELL_RADIUS_M, PLANET_RADIUS_M, TILE_SIZE_METERS,
 };
 
 const MU_EARTH: f64 = 3.986_004_418e14;
@@ -48,9 +48,22 @@ fn main() {
         epoch: 0.0,
     };
 
-    world.add_body(sample_body(1, BodyType::Ship, ship_orbit, 20.0));
-    world.add_body(sample_body(2, BodyType::Asteroid, asteroid_orbit, 1_000.0));
-    world.add_body(sample_body(3, BodyType::Debris, debris_orbit, 10.0));
+    let ship_hull = world.interior.ship.hull_shape.clone();
+    world.add_body(sample_body(
+        1,
+        BodyType::Ship,
+        ship_orbit,
+        20.0,
+        Some(ship_hull),
+    ));
+    world.add_body(sample_body(
+        2,
+        BodyType::Asteroid,
+        asteroid_orbit,
+        1_000.0,
+        None,
+    ));
+    world.add_body(sample_body(3, BodyType::Debris, debris_orbit, 10.0, None));
 
     // Prime cached position/velocity fields.
     world.step(0.0);
@@ -74,6 +87,11 @@ fn main() {
                 }
                 Command::ToggleSleep => {
                     world.interior.queue_command(InteriorCommand::ToggleSleep);
+                }
+                Command::InteractAt { x, y } => {
+                    world
+                        .interior
+                        .queue_command(InteriorCommand::InteractAt { x, y });
                 }
             }
         }
@@ -138,15 +156,26 @@ fn spawn_command_listener() -> CommandListener {
     CommandListener { receiver: rx }
 }
 
-fn sample_body(id: u64, body_type: BodyType, orbit: OrbitState, radius: f64) -> BodyState {
+fn sample_body(
+    id: u64,
+    body_type: BodyType,
+    orbit: OrbitState,
+    radius: f64,
+    hull_shape: Option<HullShape>,
+) -> BodyState {
+    let adjusted_radius = hull_shape
+        .as_ref()
+        .map(|shape| shape.bounding_radius())
+        .unwrap_or(radius);
     BodyState {
         id,
         mass: 1_000.0,
-        radius,
+        radius: adjusted_radius,
         orbit,
         position: Vec2::zero(),
         velocity: Vec2::zero(),
         body_type,
+        hull_shape,
     }
 }
 
@@ -163,8 +192,9 @@ fn build_snapshot_json(world: &World) -> String {
         if index > 0 {
             json.push(',');
         }
+        json.push('{');
         json.push_str(&format!(
-            "{{\"id\":{},\"body_type\":\"{}\",\"radius_m\":{},\"x\":{},\"y\":{},\"vx\":{},\"vy\":{}}}",
+            "\"id\":{},\"body_type\":\"{}\",\"radius_m\":{},\"x\":{},\"y\":{},\"vx\":{},\"vy\":{}",
             body.id,
             body_type_name(body.body_type),
             body.radius,
@@ -173,6 +203,19 @@ fn build_snapshot_json(world: &World) -> String {
             body.velocity.x,
             body.velocity.y
         ));
+        if let Some(hull) = &body.hull_shape {
+            json.push_str(",\"hull_shape\":{");
+            json.push_str(&format!("\"tile_size_m\":{}", TILE_SIZE_METERS));
+            json.push_str(",\"vertices\":[");
+            for (idx, vertex) in hull.vertices.iter().enumerate() {
+                if idx > 0 {
+                    json.push(',');
+                }
+                json.push_str(&format!("{{\"x\":{},\"y\":{}}}", vertex.x, vertex.y));
+            }
+            json.push_str("]}");
+        }
+        json.push('}');
     }
     json.push_str("]");
     json.push(',');
@@ -210,15 +253,88 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
         if index > 0 {
             json.push(',');
         }
+        json.push('{');
         json.push_str(&format!(
-            "{{\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+            "\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"online\":{},\"power_kw\":{}",
             device.id,
             device.device_type.as_str(),
             device.x,
             device.y,
             device.w,
-            device.h
+            device.h,
+            if device.online { "true" } else { "false" },
+            device.power_kw
         ));
+        match &device.data {
+            DeviceData::Reactor(data) => {
+                json.push_str(&format!(
+                    ",\"fuel_kg\":{},\"max_fuel_kg\":{},\"power_output_kw\":{},\"fuel_burn_rate_kg_per_s\":{},\"reactor_online\":{}",
+                    data.fuel_kg,
+                    data.max_fuel_kg,
+                    data.power_output_kw,
+                    data.fuel_burn_rate_kg_per_s,
+                    if data.online { "true" } else { "false" }
+                ));
+            }
+            DeviceData::Tank(data) => {
+                json.push_str(&format!(
+                    ",\"o2_kg\":{},\"n2_kg\":{},\"co2_kg\":{},\"xenon_kg\":{},\"capacity_kg\":{}",
+                    data.o2_kg, data.n2_kg, data.co2_kg, data.xenon_kg, data.capacity_kg
+                ));
+            }
+            DeviceData::Dispenser(data) => {
+                json.push_str(&format!(
+                    ",\"active\":{},\"rate_kg_per_s\":{},\"gas_type\":\"{}\",\"connected_tank_id\":{}",
+                    if data.active { "true" } else { "false" },
+                    data.rate_kg_per_s,
+                    gas_type_name(data.gas_type),
+                    data
+                        .connected_tank_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "null".to_string())
+                ));
+            }
+            DeviceData::Light(data) => {
+                json.push_str(&format!(
+                    ",\"intensity\":{},\"light_online\":{}",
+                    data.intensity,
+                    if data.online { "true" } else { "false" }
+                ));
+            }
+            DeviceData::Transponder(data) => {
+                json.push_str(&format!(
+                    ",\"callsign\":\"{}\",\"transponder_online\":{}",
+                    data.callsign,
+                    if data.online { "true" } else { "false" }
+                ));
+            }
+            DeviceData::ShipComputer(data) => {
+                json.push_str(&format!(
+                    ",\"ship_computer_online\":{}",
+                    if data.online { "true" } else { "false" }
+                ));
+            }
+            DeviceData::DoorDevice(data) => {
+                json.push_str(&format!(
+                    ",\"open\":{}",
+                    if data.open { "true" } else { "false" }
+                ));
+            }
+            DeviceData::FoodGenerator(data) => {
+                json.push_str(&format!(
+                    ",\"food_units\":{},\"max_food_units\":{},\"food_online\":{}",
+                    data.food_units,
+                    data.max_food_units,
+                    if data.online { "true" } else { "false" }
+                ));
+            }
+            DeviceData::BedDevice(_)
+            | DeviceData::Toilet(_)
+            | DeviceData::RCSThruster(_)
+            | DeviceData::PowerLine(_)
+            | DeviceData::GasLine(_) => {}
+        }
+        json.push('}');
     }
     json.push_str("],");
     json.push_str(&format!(
@@ -241,6 +357,20 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
         ",\"needs\":{{\"hunger\":{},\"thirst\":{},\"rest\":{}}}",
         pawn.needs.hunger, pawn.needs.thirst, pawn.needs.rest
     ));
+    json.push_str(",\"health\":{\"body_parts\":[");
+    for (idx, part) in pawn.health.body_parts.iter().enumerate() {
+        if idx > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"name\":\"{}\",\"hp\":{},\"max_hp\":{},\"vital\":{}}}",
+            part.name,
+            part.hp,
+            part.max_hp,
+            if part.vital { "true" } else { "false" }
+        ));
+    }
+    json.push_str("]}");
     json.push('}');
     json.push('}');
     json
@@ -252,6 +382,15 @@ fn body_type_name(body_type: BodyType) -> &'static str {
         BodyType::Asteroid => "Asteroid",
         BodyType::Debris => "Debris",
         BodyType::Missile => "Missile",
+    }
+}
+
+fn gas_type_name(gas: GasType) -> &'static str {
+    match gas {
+        GasType::O2 => "O2",
+        GasType::N2 => "N2",
+        GasType::CO2 => "CO2",
+        GasType::Xenon => "Xenon",
     }
 }
 
@@ -270,6 +409,11 @@ fn parse_command(line: &str) -> Option<Command> {
     }
     if trimmed.contains("toggle_sleep") {
         return Some(Command::ToggleSleep);
+    }
+    if trimmed.contains("interact_at") {
+        let x = extract_number::<u32>(trimmed, "\"x\"")?;
+        let y = extract_number::<u32>(trimmed, "\"y\"")?;
+        return Some(Command::InteractAt { x, y });
     }
     None
 }
@@ -302,4 +446,5 @@ enum Command {
     SetTimeScale(f64),
     MovePawn { dx: i32, dy: i32 },
     ToggleSleep,
+    InteractAt { x: u32, y: u32 },
 }

@@ -19,6 +19,7 @@ TRAIL_LENGTH = 300
 PICK_RADIUS_PX = 12
 ZOOM_STEP = 1.1
 HUD_MARGIN = 12
+HULL_SHAPE_MIN_PX = 18
 
 # CRT-inspired styling
 COLORS = {
@@ -359,19 +360,7 @@ def draw_snapshot(
 
     selected_id = state.selected_id
     for body in snapshot.get("bodies", []):
-        color = BODY_COLORS.get(body.get("body_type"), COLORS["fg_main"])
-        radius_px = meters_to_pixels(body.get("radius_m", 10.0), base_scale, zoom_factor)
-        sx, sy = world_to_screen(
-            body.get("x", 0.0),
-            body.get("y", 0.0),
-            cam_center,
-            base_scale,
-            zoom_factor,
-        )
-        pygame.draw.circle(screen, color, (sx, sy), radius_px)
-        if selected_id == body.get("id"):
-            pygame.draw.circle(screen, COLORS["fg_highlight"], (sx, sy), radius_px + 3, width=1)
-            pygame.draw.circle(screen, COLORS["fg_highlight"], (sx, sy), radius_px + 6, width=1)
+        draw_body(screen, body, cam_center, base_scale, zoom_factor, selected_id)
 
     draw_hud(screen, snapshot, state)
     draw_info_panel(screen, snapshot, state)
@@ -395,6 +384,57 @@ def draw_optional_ring(
     if radius_px > max(WINDOW_WIDTH, WINDOW_HEIGHT) * 4:
         return
     pygame.draw.circle(screen, color, center, radius_px, width=1)
+
+
+def draw_body(
+    screen: pygame.Surface,
+    body: Dict,
+    cam_center: Sequence[float],
+    base_scale: float,
+    zoom_factor: float,
+    selected_id: Optional[int],
+) -> None:
+    body_id = body.get("id")
+    body_type = body.get("body_type")
+    color = BODY_COLORS.get(body_type, COLORS["fg_main"])
+    radius_px = meters_to_pixels(body.get("radius_m", 10.0), base_scale, zoom_factor)
+    hull = body.get("hull_shape")
+    hull_drawn = False
+    if hull and radius_px >= HULL_SHAPE_MIN_PX:
+        vertices = hull.get("vertices", [])
+        if len(vertices) >= 3:
+            points = []
+            bx = body.get("x", 0.0)
+            by = body.get("y", 0.0)
+            for vertex in vertices:
+                wx = bx + vertex.get("x", 0.0)
+                wy = by + vertex.get("y", 0.0)
+                points.append(
+                    world_to_screen(wx, wy, cam_center, base_scale, zoom_factor)
+                )
+            if len(points) >= 3:
+                pygame.draw.polygon(screen, color, points, width=0)
+                hull_drawn = True
+                if selected_id == body_id:
+                    pygame.draw.polygon(
+                        screen, COLORS["fg_highlight"], points, width=2
+                    )
+    sx, sy = world_to_screen(
+        body.get("x", 0.0),
+        body.get("y", 0.0),
+        cam_center,
+        base_scale,
+        zoom_factor,
+    )
+    if not hull_drawn:
+        pygame.draw.circle(screen, color, (sx, sy), radius_px)
+        if selected_id == body_id:
+            pygame.draw.circle(screen, COLORS["fg_highlight"], (sx, sy), radius_px + 3, width=1)
+            pygame.draw.circle(screen, COLORS["fg_highlight"], (sx, sy), radius_px + 6, width=1)
+    else:
+        center_radius = max(2, radius_px // 6)
+        pygame.draw.circle(screen, COLORS["bg"], (sx, sy), center_radius)
+        pygame.draw.circle(screen, color, (sx, sy), center_radius, width=1)
 
 
 def format_distance(meters: float) -> str:

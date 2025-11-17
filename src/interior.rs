@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use crate::{HullShape, Vec2, TILE_SIZE_METERS};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileType {
     Empty,
@@ -212,6 +214,43 @@ pub struct Pawn {
     pub y: u32,
     pub status: PawnStatus,
     pub needs: NeedsState,
+    pub health: HealthState,
+}
+
+#[derive(Clone, Debug)]
+pub struct BodyPart {
+    pub name: String,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub vital: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct HealthState {
+    pub body_parts: Vec<BodyPart>,
+}
+
+impl HealthState {
+    pub fn new_default() -> Self {
+        let mut body_parts = Vec::new();
+        let parts = [
+            ("Head", 30.0, true),
+            ("Torso", 40.0, true),
+            ("Left Arm", 25.0, false),
+            ("Right Arm", 25.0, false),
+            ("Left Leg", 35.0, false),
+            ("Right Leg", 35.0, false),
+        ];
+        for (name, max_hp, vital) in parts {
+            body_parts.push(BodyPart {
+                name: name.to_string(),
+                hp: max_hp,
+                max_hp,
+                vital,
+            });
+        }
+        Self { body_parts }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +261,7 @@ pub struct ShipInterior {
     pub atmos: AtmosCell,
     pub power: PowerState,
     pub devices: Vec<Device>,
+    pub hull_shape: HullShape,
 }
 
 impl ShipInterior {
@@ -355,14 +395,62 @@ impl ShipInterior {
             data: DeviceData::ShipComputer(ShipComputerData { online: true }),
         });
 
-        Self {
+        next_id += 1;
+        devices.push(Device {
+            id: next_id,
+            device_type: DeviceType::BedDevice,
+            x: 2,
+            y: 2,
+            w: 1,
+            h: 1,
+            power_kw: 0.0,
+            online: true,
+            data: DeviceData::BedDevice(BedDeviceData {}),
+        });
+
+        next_id += 1;
+        devices.push(Device {
+            id: next_id,
+            device_type: DeviceType::DoorDevice,
+            x: door_x,
+            y: door_y,
+            w: 1,
+            h: 1,
+            power_kw: 0.0,
+            online: true,
+            data: DeviceData::DoorDevice(DoorDeviceData { open: true }),
+        });
+
+        next_id += 1;
+        devices.push(Device {
+            id: next_id,
+            device_type: DeviceType::FoodGenerator,
+            x: 4,
+            y: 2,
+            w: 1,
+            h: 1,
+            power_kw: 3.0,
+            online: true,
+            data: DeviceData::FoodGenerator(FoodGeneratorData {
+                food_units: 5.0,
+                max_food_units: 5.0,
+                online: true,
+            }),
+        });
+
+        let mut ship = Self {
             width,
             height,
             tiles,
             atmos,
             power,
             devices,
-        }
+            hull_shape: HullShape {
+                vertices: Vec::new(),
+            },
+        };
+        ship.rebuild_hull_shape();
+        ship
     }
 
     fn idx(x: u32, y: u32, width: u32) -> usize {
@@ -395,6 +483,115 @@ impl ShipInterior {
             TileType::Floor | TileType::Bed | TileType::DoorOpen => true,
             _ => false,
         }
+    }
+
+    pub fn set_tile_type(&mut self, x: u32, y: u32, tile_type: TileType) {
+        if x < self.width && y < self.height {
+            let idx = Self::idx(x, y, self.width);
+            self.tiles[idx].tile_type = tile_type;
+        }
+    }
+
+    fn rebuild_hull_shape(&mut self) {
+        let mut edges = Vec::new();
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let idx = Self::idx(x, y, self.width);
+                if !Self::is_hull_tile(self.tiles[idx].tile_type) {
+                    continue;
+                }
+                let xi = x as i32;
+                let yi = y as i32;
+                let neighbors = [
+                    ((0, -1), (xi, yi), (xi + 1, yi)),
+                    ((1, 0), (xi + 1, yi), (xi + 1, yi + 1)),
+                    ((0, 1), (xi + 1, yi + 1), (xi, yi + 1)),
+                    ((-1, 0), (xi, yi + 1), (xi, yi)),
+                ];
+                for (offset, start, end) in neighbors {
+                    let nx = x as i32 + offset.0;
+                    let ny = y as i32 + offset.1;
+                    let neighbor_in_bounds =
+                        nx >= 0 && ny >= 0 && (nx as u32) < self.width && (ny as u32) < self.height;
+                    let neighbor_is_hull = if neighbor_in_bounds {
+                        let n_idx = Self::idx(nx as u32, ny as u32, self.width);
+                        Self::is_hull_tile(self.tiles[n_idx].tile_type)
+                    } else {
+                        false
+                    };
+                    if !neighbor_is_hull {
+                        edges.push(((start.0, start.1), (end.0, end.1)));
+                    }
+                }
+            }
+        }
+
+        if edges.is_empty() {
+            self.hull_shape = Self::rectangular_hull(self.width, self.height);
+            return;
+        }
+
+        let mut polygon_points = Vec::new();
+        let mut remaining = edges;
+        let mut current = remaining[0].0;
+        polygon_points.push(current);
+        let mut guard = 0;
+        while !remaining.is_empty() && guard < 10_000 {
+            guard += 1;
+            if let Some(idx) = remaining.iter().position(|edge| edge.0 == current) {
+                let edge = remaining.remove(idx);
+                current = edge.1;
+                polygon_points.push(current);
+                if current == polygon_points[0] {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if polygon_points.len() < 4 || current != polygon_points[0] {
+            self.hull_shape = Self::rectangular_hull(self.width, self.height);
+            return;
+        }
+
+        if let (Some(first), Some(last)) = (polygon_points.first(), polygon_points.last()) {
+            if first == last {
+                polygon_points.pop();
+            }
+        }
+
+        let center_x = (self.width as f64 * TILE_SIZE_METERS) / 2.0;
+        let center_y = (self.height as f64 * TILE_SIZE_METERS) / 2.0;
+        let vertices = polygon_points
+            .into_iter()
+            .map(|(px, py)| {
+                let x = px as f64 * TILE_SIZE_METERS - center_x;
+                let y = center_y - py as f64 * TILE_SIZE_METERS;
+                Vec2::new(x, y)
+            })
+            .collect();
+        self.hull_shape = HullShape { vertices };
+    }
+
+    fn rectangular_hull(width: u32, height: u32) -> HullShape {
+        let w = width as f64 * TILE_SIZE_METERS / 2.0;
+        let h = height as f64 * TILE_SIZE_METERS / 2.0;
+        HullShape {
+            vertices: vec![
+                Vec2::new(-w, h),
+                Vec2::new(w, h),
+                Vec2::new(w, -h),
+                Vec2::new(-w, -h),
+            ],
+        }
+    }
+
+    fn is_hull_tile(tile_type: TileType) -> bool {
+        matches!(
+            tile_type,
+            TileType::Wall | TileType::DoorClosed | TileType::DoorOpen
+        )
     }
 
     pub fn step(&mut self, dt: f64) {
@@ -487,6 +684,7 @@ impl InteriorWorld {
             y: 3,
             status: PawnStatus::Awake,
             needs: NeedsState::new(),
+            health: HealthState::new_default(),
         };
         Self {
             ship,
@@ -514,6 +712,9 @@ impl InteriorWorld {
                 InteriorCommand::ToggleSleep => {
                     self.toggle_sleep();
                 }
+                InteriorCommand::InteractAt { x, y } => {
+                    self.interact_at(x, y);
+                }
             }
         }
     }
@@ -536,6 +737,68 @@ impl InteriorWorld {
             PawnStatus::Awake => PawnStatus::Sleeping,
             PawnStatus::Sleeping => PawnStatus::Awake,
         };
+    }
+
+    fn interact_at(&mut self, x: u32, y: u32) {
+        if x >= self.ship.width || y >= self.ship.height {
+            return;
+        }
+        let mut door_update: Option<(TileType, Vec<(u32, u32)>)> = None;
+        for device in &mut self.ship.devices {
+            if !device_contains(device, x, y) {
+                continue;
+            }
+            match &mut device.data {
+                DeviceData::BedDevice(_) => {
+                    if self.pawn.x == x && self.pawn.y == y {
+                        self.toggle_sleep();
+                    }
+                }
+                DeviceData::DoorDevice(data) => {
+                    data.open = !data.open;
+                    let tile_type = if data.open {
+                        TileType::DoorOpen
+                    } else {
+                        TileType::DoorClosed
+                    };
+                    let mut tiles = Vec::new();
+                    for ty in device.y..device.y + device.h {
+                        for tx in device.x..device.x + device.w {
+                            tiles.push((tx, ty));
+                        }
+                    }
+                    door_update = Some((tile_type, tiles));
+                }
+                DeviceData::Light(data) => {
+                    data.online = !data.online;
+                    device.online = data.online;
+                }
+                DeviceData::Reactor(data) => {
+                    if data.fuel_kg > 0.0 {
+                        data.online = !data.online;
+                        device.online = data.online;
+                    }
+                }
+                DeviceData::Dispenser(data) => {
+                    data.active = !data.active;
+                }
+                DeviceData::FoodGenerator(data) => {
+                    if data.food_units > 0.0 {
+                        let consumed = data.food_units.min(1.0);
+                        data.food_units -= consumed;
+                        self.pawn.needs.hunger = (self.pawn.needs.hunger - 0.2).max(0.0);
+                        self.pawn.needs.clamp();
+                    }
+                }
+                _ => {}
+            }
+            break;
+        }
+        if let Some((tile_type, tiles)) = door_update {
+            for (tx, ty) in tiles {
+                self.ship.set_tile_type(tx, ty, tile_type);
+            }
+        }
     }
 
     fn update_pawn_needs(&mut self, dt: f64) {
@@ -562,6 +825,11 @@ impl InteriorWorld {
 pub enum InteriorCommand {
     MovePawn { dx: i32, dy: i32 },
     ToggleSleep,
+    InteractAt { x: u32, y: u32 },
+}
+
+fn device_contains(device: &Device, x: u32, y: u32) -> bool {
+    x >= device.x && y >= device.y && x < device.x + device.w && y < device.y + device.h
 }
 
 impl TileType {
@@ -636,5 +904,31 @@ mod tests {
         let initial_o2 = interior.ship.atmos.o2_kg;
         interior.step(10.0);
         assert!(interior.ship.atmos.o2_kg > initial_o2);
+    }
+
+    #[test]
+    fn pawn_health_initialized_full() {
+        let interior = InteriorWorld::new_test_ship();
+        assert_eq!(interior.pawn.health.body_parts.len(), 6);
+        for part in &interior.pawn.health.body_parts {
+            assert!((part.hp - part.max_hp).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn hull_shape_has_vertices() {
+        let interior = InteriorWorld::new_test_ship();
+        assert!(interior.ship.hull_shape.vertices.len() >= 4);
+        assert!(interior.ship.hull_shape.bounding_radius() > 0.0);
+    }
+
+    #[test]
+    fn interact_with_bed_toggles_sleep() {
+        let mut interior = InteriorWorld::new_test_ship();
+        interior.pawn.x = 2;
+        interior.pawn.y = 2;
+        interior.queue_command(InteriorCommand::InteractAt { x: 2, y: 2 });
+        interior.step(0.0);
+        assert_eq!(interior.pawn.status, PawnStatus::Sleeping);
     }
 }
