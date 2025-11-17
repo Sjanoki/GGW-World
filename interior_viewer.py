@@ -51,7 +51,6 @@ INTERACTIVE_MODAL_KINDS = {
     "ShipComputer",
     "Dispenser",
     "FoodGenerator",
-    "DoorDevice",
 }
 
 MOVE_KEYS = {
@@ -574,8 +573,6 @@ def modal_action_specs(device: Dict) -> List[Tuple[int, str]]:
         specs.append((pygame.K_t, "[T] Toggle reactor"))
     elif kind == "Dispenser":
         specs.append((pygame.K_t, "[T] Toggle dispenser"))
-    elif kind == "DoorDevice":
-        specs.append((pygame.K_t, "[T] Toggle door"))
     if kind == "FoodGenerator":
         specs.append((pygame.K_f, "[F] Eat meal"))
     return specs
