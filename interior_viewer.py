@@ -249,15 +249,15 @@ def build_atmo_lines(atmos: Optional[Dict[str, Any]]) -> List[str]:
     if not atmos:
         return []
     pressure = float(atmos.get("pressure_kpa", 0.0))
-    o2 = float(atmos.get("o2_fraction", 0.0)) * 100.0
-    n2 = float(atmos.get("n2_fraction", 0.0)) * 100.0
-    co2 = float(atmos.get("co2_fraction", 0.0)) * 100.0
+    o2 = float(atmos.get("o2_kg", 0.0))
+    n2 = float(atmos.get("n2_kg", 0.0))
+    co2 = float(atmos.get("co2_kg", 0.0))
     return [
         "Atmos:",
         f"  P: {pressure:.1f} kPa",
-        f"  O2: {o2:.1f} %",
-        f"  N2: {n2:.1f} %",
-        f"  CO2: {co2:.1f} %",
+        f"  O2: {o2:.2f} kg",
+        f"  N2: {n2:.2f} kg",
+        f"  CO2: {co2:.3f} kg",
     ]
 
 

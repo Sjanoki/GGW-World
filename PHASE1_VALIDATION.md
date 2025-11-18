@@ -3,11 +3,12 @@
 Phase 1 established the shared orbital simulation, gravity well, and admin tooling that the later interior phases build upon. The following checklist captures the features that are already verified in the current codebase.
 
 ## ✅ Checklist
-- [x] Accurate planet + gravity well definition, including despawn radius and clamped trajectories.
-- [x] Circular and elliptical orbits for all tracked bodies with live propagation from their Kepler elements.
-- [x] Thrust events immediately recompute orbital elements and update the ship’s path.
-- [x] Real-time orbital simulation that steps continuously regardless of client connections.
-- [x] Admin orbital viewer that locks to selections, renders hull shapes, shows the scale marker, and uses the shared TCP server.
+- [x] `OrbitState` + `BodyState` structs encapsulate each body’s Kepler elements, hull data, and live Cartesian position/velocity.
+- [x] Circular and elliptical orbits propagate analytically from their elements, remaining stable over long multi-hour runs.
+- [x] Thrust events immediately recompute orbital elements so delta-V burns change apoapsis/periapsis without respawning the sim.
+- [x] Collision detection between circular bodies (ship ↔ ship or ship ↔ planet) is implemented and covered by unit tests.
+- [x] Real-time orbital simulation runs continuously at the authoritative tick regardless of connected clients.
+- [x] Admin orbital viewer connects to the shared TCP server, locks to selected bodies, renders hull outlines, and shows the zoom scale marker.
 
 ## 🔍 How to Verify
 1. Run the Rust server in TCP mode:
@@ -23,4 +24,4 @@ Phase 1 established the shared orbital simulation, gravity well, and admin tooli
    - Zoom with the mouse wheel and confirm the scale marker updates.
    - Click the ship to follow it; click empty space to release the camera.
 4. Send a thrust event (e.g., via dev tooling or scripted input) and confirm the ship’s orbit updates smoothly without respawning the server.
-5. Leave the viewer running for several minutes—bodies should keep advancing along their ellipses with no visible drift or reset.
+5. Leave the viewer running for several minutes—bodies should keep advancing along their ellipses with no visible drift or reset, and collision logs stay empty unless you intentionally intersect bodies.

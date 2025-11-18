@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ggw_world::{
+    config::GameConfig,
     interior::{DeviceData, GasType, InteriorCommand, InteriorWorld},
     BodyState, BodyType, HullShape, OrbitState, Vec2, World, DESPAWN_RADIUS_M,
     GRAVITY_WELL_RADIUS_M, PLANET_RADIUS_M, TILE_SIZE_METERS,
@@ -30,7 +31,7 @@ fn main() {
 }
 
 fn run_stdio_mode() {
-    let mut world = build_initial_world();
+    let mut world = build_initial_world(GameConfig::load());
     let stdin_listener = spawn_command_listener();
     let stdout = io::stdout();
     let mut handle = stdout.lock();
@@ -57,7 +58,7 @@ fn run_tcp_server() {
     let listener = TcpListener::bind(SERVER_ADDR).expect("failed to bind TCP listener");
     println!("GGW server listening on {}", SERVER_ADDR);
 
-    let mut world = build_initial_world();
+    let mut world = build_initial_world(GameConfig::load());
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
     let (new_client_tx, new_client_rx) = mpsc::channel::<mpsc::Sender<String>>();
 
@@ -144,8 +145,8 @@ fn spawn_client_connection(
     snapshot_tx
 }
 
-fn build_initial_world() -> World {
-    let mut world = World::new(MU_EARTH);
+fn build_initial_world(config: GameConfig) -> World {
+    let mut world = World::new(MU_EARTH, config);
     let r_planet = PLANET_RADIUS_M;
 
     let ship_orbit = OrbitState {
@@ -342,12 +343,17 @@ fn build_snapshot_json(world: &World) -> String {
     json.push_str(&build_interior_json(
         &world.interior,
         nav_context.as_deref(),
+        &world.config,
     ));
     json.push('}');
     json
 }
 
-fn build_interior_json(interior: &InteriorWorld, nav_context: Option<&str>) -> String {
+fn build_interior_json(
+    interior: &InteriorWorld,
+    nav_context: Option<&str>,
+    config: &GameConfig,
+) -> String {
     let ship = &interior.ship;
     let mut json = String::new();
     json.push_str("\"interior\":{");
@@ -368,10 +374,10 @@ fn build_interior_json(interior: &InteriorWorld, nav_context: Option<&str>) -> S
             let tile_type = ship.tile_type(x, y);
             json.push('{');
             json.push_str(&format!("\"type\":\"{}\"", tile_type.as_str()));
-            if let Some(sample) = ship.tile_atmos_sample(x, y) {
+            if let Some(sample) = ship.tile_atmos_sample(x, y, &config.atmosphere) {
                 json.push_str(&format!(
-                    ",\"atmos\":{{\"pressure_kpa\":{},\"o2_fraction\":{},\"n2_fraction\":{},\"co2_fraction\":{}}}",
-                    sample.pressure_kpa, sample.o2_fraction, sample.n2_fraction, sample.co2_fraction
+                    ",\"atmos\":{{\"pressure_kpa\":{},\"o2_kg\":{},\"n2_kg\":{},\"co2_kg\":{}}}",
+                    sample.pressure_kpa, sample.o2_kg, sample.n2_kg, sample.co2_kg
                 ));
             } else {
                 json.push_str(",\"atmos\":null");

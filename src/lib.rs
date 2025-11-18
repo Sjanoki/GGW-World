@@ -1,7 +1,10 @@
 use core::f64::consts::PI;
 
+pub mod config;
+
 pub mod interior;
 
+use config::GameConfig;
 use interior::InteriorWorld;
 
 pub const PLANET_RADIUS_M: f64 = 6_371_000.0;
@@ -298,17 +301,20 @@ pub struct World {
     pub bodies: Vec<BodyState>,
     pub planet_radius: f64,
     pub interior: InteriorWorld,
+    pub config: GameConfig,
     next_id: u64,
 }
 
 impl World {
-    pub fn new(mu: f64) -> Self {
+    pub fn new(mu: f64, config: GameConfig) -> Self {
+        let interior = InteriorWorld::new_test_ship(&config);
         Self {
             mu,
             sim_time: 0.0,
             bodies: Vec::new(),
             planet_radius: PLANET_RADIUS_M,
-            interior: InteriorWorld::new_test_ship(),
+            interior,
+            config,
             next_id: 1,
         }
     }
@@ -341,7 +347,7 @@ impl World {
             body.velocity = vel;
         }
         self.cull_despawned_bodies();
-        self.interior.step(dt);
+        self.interior.step(dt, &self.config);
     }
 
     pub fn is_inside_gravity_well(&self, body: &BodyState) -> bool {
@@ -467,7 +473,7 @@ mod tests {
 
     #[test]
     fn thrust_event_changes_orbit() {
-        let mut world = World::new(MU_EARTH);
+        let mut world = World::new(MU_EARTH, GameConfig::default());
         let a = 7_000_000.0;
         let body = BodyState {
             id: 0,
