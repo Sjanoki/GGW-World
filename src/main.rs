@@ -2,6 +2,8 @@ use std::env;
 use std::f64::consts::FRAC_PI_4;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
+use std::f64::consts::FRAC_PI_4;
+use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -139,6 +141,17 @@ fn spawn_client_connection(
 }
 
 fn build_initial_world() -> World {
+    BodyState, BodyType, OrbitState, Vec2, World, DESPAWN_RADIUS_M, GRAVITY_WELL_RADIUS_M,
+    PLANET_RADIUS_M,
+};
+
+const MU_EARTH: f64 = 3.986_004_418e14;
+const DEFAULT_DT_SECONDS: f64 = 10.0;
+const MAX_TIME_SCALE: f64 = 10_000.0;
+const MAX_SIM_DT: f64 = 1.0;
+const SNAPSHOT_SLEEP_MS: u64 = 50;
+
+fn main() {
     let mut world = World::new(MU_EARTH);
     let r_planet = PLANET_RADIUS_M;
 
@@ -226,6 +239,41 @@ fn apply_command(world: &mut World, command: Command, time_scale: &mut f64) {
                 .interior
                 .queue_command(InteriorCommand::InteractAt { x, y });
         }
+    world.add_body(sample_body(1, BodyType::Ship, ship_orbit, 20.0));
+    world.add_body(sample_body(2, BodyType::Asteroid, asteroid_orbit, 1_000.0));
+    world.add_body(sample_body(3, BodyType::Debris, debris_orbit, 10.0));
+
+    // Prime cached position/velocity fields.
+    world.step(0.0);
+
+    let stdin_thread = spawn_command_listener();
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    let mut time_scale = DEFAULT_DT_SECONDS;
+    let mut last_real = Instant::now();
+
+    loop {
+        if let Some(new_scale) = stdin_thread.try_recv_time_scale() {
+            time_scale = new_scale;
+        }
+
+        let now = Instant::now();
+        let real_dt = now.duration_since(last_real).as_secs_f64();
+        last_real = now;
+
+        let mut sim_dt = time_scale * real_dt;
+        if sim_dt > MAX_SIM_DT {
+            sim_dt = MAX_SIM_DT;
+        }
+        if sim_dt < 0.0 {
+            sim_dt = 0.0;
+        }
+
+        world.step(sim_dt);
+        let snapshot_json = build_snapshot_json(&world);
+        writeln!(handle, "{}", snapshot_json).expect("stdout write");
+        handle.flush().expect("stdout flush");
+        thread::sleep(Duration::from_millis(SNAPSHOT_SLEEP_MS));
     }
 }
 
@@ -246,6 +294,18 @@ impl CommandListener {
                 }
                 Err(TryRecvError::Empty) => return commands,
                 Err(TryRecvError::Disconnected) => return commands,
+    fn try_recv_time_scale(&self) -> Option<f64> {
+        use std::sync::mpsc::TryRecvError;
+        let mut latest: Option<f64> = None;
+        loop {
+            match self.receiver.try_recv() {
+                Ok(line) => {
+                    if let Some(scale) = parse_time_scale_command(&line) {
+                        latest = Some(scale);
+                    }
+                }
+                Err(TryRecvError::Empty) => return latest,
+                Err(TryRecvError::Disconnected) => return latest,
             }
         }
     }
@@ -284,6 +344,11 @@ fn sample_body(
         id,
         mass: 1_000.0,
         radius: adjusted_radius,
+fn sample_body(id: u64, body_type: BodyType, orbit: OrbitState, radius: f64) -> BodyState {
+    BodyState {
+        id,
+        mass: 1_000.0,
+        radius,
         orbit,
         position: Vec2::zero(),
         velocity: Vec2::zero(),
@@ -308,6 +373,8 @@ fn build_snapshot_json(world: &World) -> String {
         json.push('{');
         json.push_str(&format!(
             "\"id\":{},\"body_type\":\"{}\",\"radius_m\":{},\"x\":{},\"y\":{},\"vx\":{},\"vy\":{}",
+        json.push_str(&format!(
+            "{{\"id\":{},\"body_type\":\"{}\",\"radius_m\":{},\"x\":{},\"y\":{},\"vx\":{},\"vy\":{}}}",
             body.id,
             body_type_name(body.body_type),
             body.radius,
@@ -502,6 +569,8 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
     json.push_str("]}");
     json.push('}');
     json.push('}');
+    }
+    json.push_str("]}");
     json
 }
 
@@ -562,6 +631,14 @@ fn clamp_time_scale(value: f64) -> f64 {
 fn extract_number<T: core::str::FromStr>(line: &str, key: &str) -> Option<T> {
     let start = line.find(key)? + key.len();
     let after_key = line.get(start..)?;
+fn parse_time_scale_command(line: &str) -> Option<f64> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') || !trimmed.contains("set_time_scale") {
+        return None;
+    }
+    let key = "\"time_scale\"";
+    let start = trimmed.find(key)? + key.len();
+    let after_key = trimmed.get(start..)?;
     let colon_index = after_key.find(':')?;
     let after_colon = after_key.get(colon_index + 1..)?.trim_start();
     let end_index = after_colon
@@ -576,4 +653,16 @@ enum Command {
     MovePawn { dx: i32, dy: i32 },
     ToggleSleep,
     InteractAt { x: u32, y: u32 },
+    value_str
+        .parse::<f64>()
+        .ok()
+        .map(|value| clamp_time_scale(value))
+}
+
+fn clamp_time_scale(value: f64) -> f64 {
+    if value.is_nan() {
+        DEFAULT_DT_SECONDS
+    } else {
+        value.max(0.0).min(MAX_TIME_SCALE)
+    }
 }

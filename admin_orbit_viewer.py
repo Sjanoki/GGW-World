@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import json
 import math
-import socket
-import time
+import os
+import subprocess
+import sys
 from collections import defaultdict, deque
-from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pygame
 
@@ -18,12 +19,6 @@ TRAIL_LENGTH = 300
 PICK_RADIUS_PX = 12
 ZOOM_STEP = 1.1
 HUD_MARGIN = 12
-HULL_SHAPE_MIN_PX = 6
-MAX_ZOOM_PX_PER_M = 6.0
-SCALE_BAR_MIN_PX = 80
-SCALE_BAR_MAX_PX = 200
-SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 40000
 
 # CRT-inspired styling
 COLORS = {
@@ -70,82 +65,34 @@ class ViewerState:
         self.zoom_factor_min: float = 1e-4
         self.zoom_factor_max: Optional[float] = None
         self.camera_center_world: List[float] = [0.0, 0.0]
-        self.camera_follow: bool = False
-        self.camera_offset: List[float] = [0.0, 0.0]
         self.is_panning: bool = False
         self.pan_start_mouse: Tuple[int, int] = (0, 0)
         self.pan_start_center: Tuple[float, float] = (0.0, 0.0)
-        self.pan_start_offset: Tuple[float, float] = (0.0, 0.0)
         self.selected_id: Optional[int] = None
         self.selected_planet: bool = False
-        self.sim_speed: float = 1.0
+        self.sim_speed: float = 10.0
 
 
-class ServerConnection:
-    def __init__(self) -> None:
-        self.addr = (SERVER_HOST, SERVER_PORT)
-        self.sock: Optional[socket.socket] = None
-        self.sock_file = None
-        self.connect()
+def server_binary_path() -> str:
+    exe = "ggw_world.exe" if os.name == "nt" else "ggw_world"
+    path = os.path.join("target", "debug", exe)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Binary '{path}' not found. Run 'cargo build --bin ggw_world' first."
+        )
+    return path
 
-    def connect(self) -> None:
-        while True:
-            try:
-                sock = socket.create_connection(self.addr)
-            except OSError:
-                print(
-                    "Could not connect to GGW server at 127.0.0.1:40000, retrying...",
-                    flush=True,
-                )
-                time.sleep(1.0)
-                continue
-            self.sock = sock
-            self.sock_file = sock.makefile("r", encoding="utf-8")
-            print("Connected to GGW server.", flush=True)
-            break
 
-    def close(self) -> None:
-        if self.sock_file is not None:
-            try:
-                self.sock_file.close()
-            except OSError:
-                pass
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-        self.sock = None
-        self.sock_file = None
-
-    def readline(self) -> str:
-        while True:
-            if self.sock_file is None:
-                self.connect()
-                continue
-            try:
-                line = self.sock_file.readline()
-            except OSError:
-                self.close()
-                continue
-            if line == "":
-                print("Connection to GGW server lost, reconnecting...", flush=True)
-                self.close()
-                continue
-            return line
-
-    def send_json(self, payload: Dict[str, Any]) -> None:
-        data = (json.dumps(payload) + "\n").encode("utf-8")
-        while True:
-            if self.sock is None:
-                self.connect()
-            try:
-                assert self.sock is not None
-                self.sock.sendall(data)
-                return
-            except OSError:
-                print("Send failed, reconnecting to GGW server...", flush=True)
-                self.close()
+def launch_server() -> subprocess.Popen:
+    path = server_binary_path()
+    return subprocess.Popen(
+        [path],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
 
 
 def init_pygame() -> pygame.Surface:
@@ -185,7 +132,7 @@ def ensure_base_scale(snapshot: Dict, state: ViewerState) -> None:
     state.base_scale = base_scale
     state.zoom_factor = 1.0
     state.zoom_factor_min = 1e-4
-    max_zoom = max(state.zoom_factor_min, MAX_ZOOM_PX_PER_M / base_scale)
+    max_zoom = max(state.zoom_factor_min, 1.0 / base_scale)
     state.zoom_factor_max = max_zoom
     state.zoom_factor = clamp(state.zoom_factor, state.zoom_factor_min, state.zoom_factor_max)
     state.camera_center_world = [0.0, 0.0]
@@ -238,44 +185,30 @@ def update_trails(trails: Dict[int, Deque[Tuple[float, float]]], snapshot: Dict)
             trail.popleft()
 
 
-def update_camera_center(snapshot: Dict, state: ViewerState) -> None:
-    if not state.camera_follow or state.selected_id is None:
-        return
-    body = find_body_by_id(snapshot, state.selected_id)
-    if body is None:
-        state.camera_follow = False
-        return
-    state.camera_center_world[0] = body.get("x", 0.0) + state.camera_offset[0]
-    state.camera_center_world[1] = body.get("y", 0.0) + state.camera_offset[1]
-
-
-def prune_trails(
-    trails: Dict[int, Deque[Tuple[float, float]]],
-    current_ids: Iterable[int],
-    state: ViewerState,
-) -> None:
+def prune_trails(trails: Dict[int, Deque[Tuple[float, float]]], current_ids: Iterable[int]) -> None:
     valid = set(current_ids)
     for body_id in list(trails.keys()):
         if body_id not in valid:
             del trails[body_id]
-    if state.selected_id is not None and state.selected_id not in valid:
-        state.selected_id = None
-        state.camera_follow = False
-        state.camera_offset = [0.0, 0.0]
 
 
-def send_time_scale_command(conn: ServerConnection, time_scale: float) -> None:
-    conn.send_json({"type": "set_time_scale", "time_scale": time_scale})
+def send_time_scale_command(server: subprocess.Popen, time_scale: float) -> None:
+    if server.stdin is None:
+        return
+    try:
+        payload = json.dumps({"type": "set_time_scale", "time_scale": time_scale})
+        server.stdin.write(payload + "\n")
+        server.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
 
 
-def set_sim_speed(conn: ServerConnection, state: ViewerState, new_speed: float) -> None:
+def set_sim_speed(server: subprocess.Popen, state: ViewerState, new_speed: float) -> None:
     state.sim_speed = new_speed
-    send_time_scale_command(conn, new_speed)
+    send_time_scale_command(server, new_speed)
 
 
-def handle_events(
-    snapshot: Optional[Dict], state: ViewerState, conn: ServerConnection
-) -> bool:
+def handle_events(snapshot: Optional[Dict], state: ViewerState, server: subprocess.Popen) -> bool:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             return False
@@ -283,7 +216,7 @@ def handle_events(
             if event.key == pygame.K_ESCAPE:
                 return False
             if event.key in SIM_SPEED_KEYS:
-                set_sim_speed(conn, state, SIM_SPEED_KEYS[event.key])
+                set_sim_speed(server, state, SIM_SPEED_KEYS[event.key])
         if event.type == pygame.MOUSEWHEEL and state.base_scale is not None:
             if event.y > 0:
                 state.zoom_factor *= ZOOM_STEP
@@ -294,11 +227,9 @@ def handle_events(
                 state.zoom_factor = min(state.zoom_factor, state.zoom_factor_max)
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if not attempt_selection(snapshot, state, event.pos):
-                clear_selection(state)
                 state.is_panning = True
                 state.pan_start_mouse = event.pos
                 state.pan_start_center = tuple(state.camera_center_world)
-                state.pan_start_offset = tuple(state.camera_offset)
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             state.is_panning = False
         if event.type == pygame.MOUSEMOTION and state.is_panning and state.base_scale is not None:
@@ -306,16 +237,8 @@ def handle_events(
             if scale > 0.0:
                 dx = event.pos[0] - state.pan_start_mouse[0]
                 dy = event.pos[1] - state.pan_start_mouse[1]
-                if state.camera_follow:
-                    state.camera_offset[0] = state.pan_start_offset[0] - dx / scale
-                    state.camera_offset[1] = state.pan_start_offset[1] + dy / scale
-                else:
-                    state.camera_center_world[0] = (
-                        state.pan_start_center[0] - dx / scale
-                    )
-                    state.camera_center_world[1] = (
-                        state.pan_start_center[1] + dy / scale
-                    )
+                state.camera_center_world[0] = state.pan_start_center[0] - dx / scale
+                state.camera_center_world[1] = state.pan_start_center[1] + dy / scale
     return True
 
 
@@ -342,20 +265,6 @@ def find_body_under_cursor(
     return best_id
 
 
-def find_body_by_id(snapshot: Dict, body_id: int) -> Optional[Dict]:
-    for body in snapshot.get("bodies", []):
-        if body.get("id") == body_id:
-            return body
-    return None
-
-
-def clear_selection(state: ViewerState) -> None:
-    state.selected_planet = False
-    state.selected_id = None
-    state.camera_follow = False
-    state.camera_offset = [0.0, 0.0]
-
-
 def attempt_selection(snapshot: Optional[Dict], state: ViewerState, mouse_pos: Tuple[int, int]) -> bool:
     if snapshot is None or state.base_scale is None:
         return False
@@ -372,26 +281,15 @@ def attempt_selection(snapshot: Optional[Dict], state: ViewerState, mouse_pos: T
     if planet_radius > 0.0 and distance <= planet_radius * 1.02:
         state.selected_planet = True
         state.selected_id = None
-        state.camera_follow = False
-        state.camera_offset = [0.0, 0.0]
-        state.camera_center_world = [0.0, 0.0]
         state.is_panning = False
         return True
 
     body_id = find_body_under_cursor(snapshot, mouse_pos, state)
     if body_id is not None:
-        body = find_body_by_id(snapshot, body_id)
-        if body is not None:
-            state.selected_planet = False
-            state.selected_id = body_id
-            state.camera_follow = True
-            state.camera_offset = [0.0, 0.0]
-            state.camera_center_world = [
-                body.get("x", 0.0),
-                body.get("y", 0.0),
-            ]
-            state.is_panning = False
-            return True
+        state.selected_planet = False
+        state.selected_id = body_id
+        state.is_panning = False
+        return True
     return False
 
 
@@ -461,11 +359,22 @@ def draw_snapshot(
 
     selected_id = state.selected_id
     for body in snapshot.get("bodies", []):
-        draw_body(screen, body, cam_center, base_scale, zoom_factor, selected_id)
+        color = BODY_COLORS.get(body.get("body_type"), COLORS["fg_main"])
+        radius_px = meters_to_pixels(body.get("radius_m", 10.0), base_scale, zoom_factor)
+        sx, sy = world_to_screen(
+            body.get("x", 0.0),
+            body.get("y", 0.0),
+            cam_center,
+            base_scale,
+            zoom_factor,
+        )
+        pygame.draw.circle(screen, color, (sx, sy), radius_px)
+        if selected_id == body.get("id"):
+            pygame.draw.circle(screen, COLORS["fg_highlight"], (sx, sy), radius_px + 3, width=1)
+            pygame.draw.circle(screen, COLORS["fg_highlight"], (sx, sy), radius_px + 6, width=1)
 
     draw_hud(screen, snapshot, state)
     draw_info_panel(screen, snapshot, state)
-    draw_scale_bar(screen, state)
 
     pygame.display.flip()
 
@@ -486,58 +395,6 @@ def draw_optional_ring(
     if radius_px > max(WINDOW_WIDTH, WINDOW_HEIGHT) * 4:
         return
     pygame.draw.circle(screen, color, center, radius_px, width=1)
-
-
-def draw_body(
-    screen: pygame.Surface,
-    body: Dict,
-    cam_center: Sequence[float],
-    base_scale: float,
-    zoom_factor: float,
-    selected_id: Optional[int],
-) -> None:
-    body_id = body.get("id")
-    body_type = body.get("body_type")
-    color = BODY_COLORS.get(body_type, COLORS["fg_main"])
-    radius_px = meters_to_pixels(body.get("radius_m", 10.0), base_scale, zoom_factor)
-    hull = body.get("hull_shape")
-    hull_drawn = False
-    if hull and radius_px >= HULL_SHAPE_MIN_PX:
-        vertices = hull.get("vertices", [])
-        if len(vertices) >= 3:
-            points: List[Tuple[int, int]] = []
-            bx = body.get("x", 0.0)
-            by = body.get("y", 0.0)
-            for vertex in vertices:
-                wx = bx + vertex.get("x", 0.0)
-                wy = by + vertex.get("y", 0.0)
-                points.append(
-                    world_to_screen(wx, wy, cam_center, base_scale, zoom_factor)
-                )
-            if len(points) >= 3:
-                pygame.draw.polygon(screen, COLORS["planet_fill"], points)
-                pygame.draw.polygon(screen, color, points, width=2)
-                hull_drawn = True
-                if selected_id == body_id:
-                    pygame.draw.polygon(
-                        screen, COLORS["fg_highlight"], points, width=3
-                    )
-    sx, sy = world_to_screen(
-        body.get("x", 0.0),
-        body.get("y", 0.0),
-        cam_center,
-        base_scale,
-        zoom_factor,
-    )
-    if not hull_drawn:
-        pygame.draw.circle(screen, color, (sx, sy), radius_px)
-        if selected_id == body_id:
-            pygame.draw.circle(screen, COLORS["fg_highlight"], (sx, sy), radius_px + 3, width=1)
-            pygame.draw.circle(screen, COLORS["fg_highlight"], (sx, sy), radius_px + 6, width=1)
-    else:
-        center_radius = max(2, radius_px // 6)
-        pygame.draw.circle(screen, COLORS["bg"], (sx, sy), center_radius)
-        pygame.draw.circle(screen, color, (sx, sy), center_radius, width=1)
 
 
 def format_distance(meters: float) -> str:
@@ -592,56 +449,6 @@ def draw_info_panel(screen: pygame.Surface, snapshot: Dict, state: ViewerState) 
         surface = FONT_SMALL.render(line, True, COLORS["fg_main"])
         screen.blit(surface, (rect.left + padding, y))
         y += body_height
-
-
-def draw_scale_bar(screen: pygame.Surface, state: ViewerState) -> None:
-    if FONT_SMALL is None or state.base_scale is None:
-        return
-    scale = state.base_scale * state.zoom_factor
-    if scale <= 0:
-        return
-    meters_per_px = 1.0 / scale
-    distance_m, px_len = choose_scale_bar_distance(meters_per_px)
-    if distance_m <= 0.0 or px_len <= 0.0:
-        return
-    width = max(1, int(px_len))
-    bar_height = 6
-    padding = HUD_MARGIN
-    rect = pygame.Rect(
-        WINDOW_WIDTH - padding - width,
-        WINDOW_HEIGHT - padding - bar_height - FONT_SMALL.get_linesize() - 6,
-        width,
-        bar_height,
-    )
-    pygame.draw.rect(screen, COLORS["fg_main"], rect, width=2)
-    label = format_distance(distance_m)
-    text_surface = FONT_SMALL.render(label, True, COLORS["fg_main"])
-    text_rect = text_surface.get_rect(midtop=(rect.centerx, rect.bottom + 4))
-    screen.blit(text_surface, text_rect)
-
-
-def choose_scale_bar_distance(meters_per_px: float) -> Tuple[float, float]:
-    if meters_per_px <= 0.0:
-        return 0.0, 0.0
-    target_px = (SCALE_BAR_MIN_PX + SCALE_BAR_MAX_PX) / 2.0
-    raw_distance = meters_per_px * target_px
-    if raw_distance <= 0.0:
-        raw_distance = meters_per_px
-    exponent = math.floor(math.log10(raw_distance)) if raw_distance > 0 else 0
-    best_distance = raw_distance
-    best_px = raw_distance / meters_per_px
-    for exp in range(exponent - 3, exponent + 4):
-        magnitude = 10.0 ** exp
-        for factor in (1.0, 2.0, 5.0):
-            candidate = factor * magnitude
-            px_len = candidate / meters_per_px
-            if SCALE_BAR_MIN_PX <= px_len <= SCALE_BAR_MAX_PX:
-                return candidate, px_len
-            if abs(px_len - target_px) < abs(best_px - target_px):
-                best_distance = candidate
-                best_px = px_len
-    clamped_px = clamp(best_px, SCALE_BAR_MIN_PX, SCALE_BAR_MAX_PX)
-    return meters_per_px * clamped_px, clamped_px
 
 
 def build_selection_info(snapshot: Dict, state: ViewerState) -> Optional[Tuple[str, List[str]]]:
@@ -700,6 +507,8 @@ def build_selection_info(snapshot: Dict, state: ViewerState) -> Optional[Tuple[s
 def main() -> None:
     screen = init_pygame()
     conn = ServerConnection()
+    server = launch_server()
+    screen = init_pygame()
     trails: Dict[int, Deque[Tuple[float, float]]] = defaultdict(
         lambda: deque(maxlen=TRAIL_LENGTH)
     )
@@ -712,6 +521,12 @@ def main() -> None:
                 break
 
             line = conn.readline()
+            if not handle_events(snapshot, state, server):
+                break
+
+            line = server.stdout.readline() if server.stdout else ""
+            if line == "":
+                break
             line = line.strip()
             if not line:
                 continue
@@ -724,13 +539,29 @@ def main() -> None:
 
             update_trails(trails, snapshot)
             update_camera_center(snapshot, state)
+            prune_trails(trails, current_ids)
+            if state.selected_id is not None and state.selected_id not in current_ids:
+                state.selected_id = None
+
+            update_trails(trails, snapshot)
             draw_snapshot(screen, snapshot, trails, state)
     except KeyboardInterrupt:
         pass
     finally:
         conn.close()
+        if server.poll() is None:
+            server.terminate()
+            try:
+                server.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                server.kill()
         pygame.quit()
 
 
 if __name__ == "__main__":
     main()
+    try:
+        main()
+    except FileNotFoundError as exc:
+        print(exc)
+        sys.exit(1)
