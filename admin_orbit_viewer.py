@@ -505,6 +505,8 @@ def build_selection_info(snapshot: Dict, state: ViewerState) -> Optional[Tuple[s
 
 
 def main() -> None:
+    screen = init_pygame()
+    conn = ServerConnection()
     server = launch_server()
     screen = init_pygame()
     trails: Dict[int, Deque[Tuple[float, float]]] = defaultdict(
@@ -515,6 +517,10 @@ def main() -> None:
 
     try:
         while True:
+            if not handle_events(snapshot, state, conn):
+                break
+
+            line = conn.readline()
             if not handle_events(snapshot, state, server):
                 break
 
@@ -529,6 +535,10 @@ def main() -> None:
             ensure_base_scale(snapshot, state)
 
             current_ids = {body["id"] for body in snapshot.get("bodies", [])}
+            prune_trails(trails, current_ids, state)
+
+            update_trails(trails, snapshot)
+            update_camera_center(snapshot, state)
             prune_trails(trails, current_ids)
             if state.selected_id is not None and state.selected_id not in current_ids:
                 state.selected_id = None
@@ -538,6 +548,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        conn.close()
         if server.poll() is None:
             server.terminate()
             try:
@@ -548,6 +559,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    main()
     try:
         main()
     except FileNotFoundError as exc:

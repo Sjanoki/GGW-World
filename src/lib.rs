@@ -1,9 +1,28 @@
 use core::f64::consts::PI;
 
+pub mod interior;
+
+use interior::InteriorWorld;
+
 pub const PLANET_RADIUS_M: f64 = 6_371_000.0;
 pub const GRAVITY_WELL_RADIUS_M: f64 = 1_500_000_000.0;
 pub const GRAVITY_WELL_ALTITUDE_M: f64 = GRAVITY_WELL_RADIUS_M - PLANET_RADIUS_M;
 pub const DESPAWN_RADIUS_M: f64 = PLANET_RADIUS_M + 3.0 * GRAVITY_WELL_ALTITUDE_M;
+pub const TILE_SIZE_METERS: f64 = 1.0;
+
+#[derive(Clone, Debug)]
+pub struct HullShape {
+    pub vertices: Vec<Vec2>,
+}
+
+impl HullShape {
+    pub fn bounding_radius(&self) -> f64 {
+        self.vertices
+            .iter()
+            .map(|v| v.length())
+            .fold(0.0_f64, f64::max)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vec2 {
@@ -113,6 +132,7 @@ pub struct BodyState {
     pub position: Vec2,
     pub velocity: Vec2,
     pub body_type: BodyType,
+    pub hull_shape: Option<HullShape>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,6 +297,7 @@ pub struct World {
     pub sim_time: f64,
     pub bodies: Vec<BodyState>,
     pub planet_radius: f64,
+    pub interior: InteriorWorld,
     next_id: u64,
 }
 
@@ -287,6 +308,7 @@ impl World {
             sim_time: 0.0,
             bodies: Vec::new(),
             planet_radius: PLANET_RADIUS_M,
+            interior: InteriorWorld::new_test_ship(),
             next_id: 1,
         }
     }
@@ -295,6 +317,9 @@ impl World {
         if body.id == 0 {
             body.id = self.next_id;
             self.next_id += 1;
+        }
+        if let Some(shape) = &body.hull_shape {
+            body.radius = shape.bounding_radius();
         }
         let (pos, vel) = orbit_to_cartesian(&body.orbit, self.mu, self.sim_time);
         body.position = pos;
@@ -316,6 +341,7 @@ impl World {
             body.velocity = vel;
         }
         self.cull_despawned_bodies();
+        self.interior.step(dt);
     }
 
     pub fn is_inside_gravity_well(&self, body: &BodyState) -> bool {
@@ -457,6 +483,7 @@ mod tests {
             position: Vec2::zero(),
             velocity: Vec2::zero(),
             body_type: BodyType::Ship,
+            hull_shape: None,
         };
         let body_id = world.add_body(body);
 
