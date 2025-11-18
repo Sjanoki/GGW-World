@@ -9,6 +9,7 @@ Phase 1 established the shared orbital simulation, gravity well, and admin tooli
 - [x] Collision detection between circular bodies (ship ↔ ship or ship ↔ planet) is implemented and covered by unit tests.
 - [x] Real-time orbital simulation runs continuously at the authoritative tick regardless of connected clients.
 - [x] Admin orbital viewer connects to the shared TCP server, locks to selected bodies, renders hull outlines, and shows the zoom scale marker.
+- [x] Baseline ship power draw and reactor output are data-driven via `config/game_config.toml`, so tuning the sandbox’s energy budget no longer requires recompiling (interactive power management lives in Phase 2+).
 
 ## 🔍 How to Verify
 1. Run the Rust server in TCP mode:

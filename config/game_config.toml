@@ -63,6 +63,22 @@ idle_power_kw  = 0.0
 display_name   = "Door"
 idle_power_kw  = 0.0
 
+[default_tank]
+o2_mass_kg  = 80.0
+n2_mass_kg  = 0.0
+co2_mass_kg = 0.0
+
+[power]
+reactor_output_kw  = 500.0
+nav_station_kw     = 1.5
+ship_computer_kw   = 2.5
+transponder_kw     = 5.0
+dispenser_kw       = 0.5
+food_generator_kw  = 0.5
+light_kw           = 0.1
+bed_kw             = 0.0
+door_kw            = 0.0
+
 [resources.iron_ore]
 density_kg_per_m3 = 5200.0
 

@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct GameConfig {
@@ -10,6 +10,10 @@ pub struct GameConfig {
     pub items: HashMap<String, ItemConfig>,
     #[serde(default)]
     pub resources: HashMap<String, ResourceConfig>,
+    #[serde(default)]
+    pub default_tank: TankContentsConfig,
+    #[serde(default)]
+    pub power: PowerConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -47,27 +51,88 @@ pub struct ResourceConfig {
     pub density_kg_per_m3: f32,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct TankContentsConfig {
+    pub o2_mass_kg: f32,
+    pub n2_mass_kg: f32,
+    pub co2_mass_kg: f32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct PowerConfig {
+    pub reactor_output_kw: f32,
+    pub nav_station_kw: f32,
+    pub ship_computer_kw: f32,
+    pub transponder_kw: f32,
+    pub dispenser_kw: f32,
+    pub food_generator_kw: f32,
+    pub light_kw: f32,
+    pub bed_kw: f32,
+    pub door_kw: f32,
+}
+
+impl Default for TankContentsConfig {
+    fn default() -> Self {
+        Self {
+            o2_mass_kg: 80.0,
+            n2_mass_kg: 0.0,
+            co2_mass_kg: 0.0,
+        }
+    }
+}
+
+impl Default for PowerConfig {
+    fn default() -> Self {
+        Self {
+            reactor_output_kw: 500.0,
+            nav_station_kw: 1.5,
+            ship_computer_kw: 2.5,
+            transponder_kw: 5.0,
+            dispenser_kw: 0.5,
+            food_generator_kw: 0.5,
+            light_kw: 0.1,
+            bed_kw: 0.0,
+            door_kw: 0.0,
+        }
+    }
+}
+
 impl GameConfig {
     pub fn load() -> Self {
-        let path = Path::new("config/game_config.toml");
-        match fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents).unwrap_or_else(|err| {
-                eprintln!(
-                    "Failed to parse {} ({}), using defaults.",
-                    path.display(),
-                    err
-                );
-                Self::default()
-            }),
-            Err(err) => {
-                eprintln!(
-                    "Failed to read {} ({}), using defaults.",
-                    path.display(),
-                    err
-                );
-                Self::default()
+        let search_paths = [
+            PathBuf::from("config/game_config.toml"),
+            PathBuf::from("../config/game_config.toml"),
+            PathBuf::from("../../config/game_config.toml"),
+        ];
+        let mut tried = Vec::new();
+        for path in &search_paths {
+            tried.push(path.display().to_string());
+            if !path.exists() {
+                continue;
+            }
+            match fs::read_to_string(path) {
+                Ok(contents) => {
+                    return toml::from_str(&contents).unwrap_or_else(|err| {
+                        eprintln!(
+                            "Failed to parse {} ({}), using defaults.",
+                            path.display(),
+                            err
+                        );
+                        Self::default()
+                    });
+                }
+                Err(_) => continue,
             }
         }
+        if !tried.is_empty() {
+            eprintln!(
+                "Failed to read config from any of [{}], using defaults.",
+                tried.join(", ")
+            );
+        }
+        Self::default()
     }
 }
 
@@ -241,6 +306,8 @@ impl Default for GameConfig {
             },
             items,
             resources,
+            default_tank: TankContentsConfig::default(),
+            power: PowerConfig::default(),
         }
     }
 }

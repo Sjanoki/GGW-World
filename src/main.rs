@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ggw_world::{
     config::GameConfig,
-    interior::{DeviceData, GasType, InteriorCommand, InteriorWorld},
+    interior::{DeviceAction, DeviceData, GasType, InteriorCommand, InteriorWorld},
     BodyState, BodyType, HullShape, OrbitState, Vec2, World, DESPAWN_RADIUS_M,
     GRAVITY_WELL_RADIUS_M, PLANET_RADIUS_M, TILE_SIZE_METERS,
 };
@@ -232,6 +232,16 @@ fn apply_command(world: &mut World, command: Command, time_scale: &mut f64) {
             world
                 .interior
                 .queue_command(InteriorCommand::InteractAt { x, y });
+        }
+        Command::DeviceAction { device_id, action } => {
+            world
+                .interior
+                .queue_command(InteriorCommand::DeviceAction { device_id, action });
+        }
+        Command::ShipComputerToggle { device_id } => {
+            world
+                .interior
+                .queue_command(InteriorCommand::ShipComputerToggle { device_id });
         }
     }
 }
@@ -497,6 +507,26 @@ fn build_interior_json(
         "\"power\":{{\"net_kw\":{},\"total_production_kw\":{},\"total_consumption_kw\":{}}},",
         ship.power.net_kw, ship.power.total_production_kw, ship.power.total_consumption_kw
     ));
+    let summary = &ship.power_summary;
+    json.push_str(&format!(
+        "\"power_summary\":{{\"generation_kw\":{},\"load_kw\":{},\"net_kw\":{},\"devices\":[",
+        summary.generation_kw, summary.load_kw, summary.net_kw
+    ));
+    for (idx, device) in summary.devices.iter().enumerate() {
+        if idx > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"id\":{},\"name\":\"{}\",\"group\":\"{}\",\"draw_kw\":{},\"online\":{},\"controllable\":{}}}",
+            device.id,
+            device.name,
+            device.group.as_str(),
+            device.draw_kw,
+            if device.online { "true" } else { "false" },
+            if device.controllable { "true" } else { "false" }
+        ));
+    }
+    json.push_str("]},");
     let pawn = &interior.pawn;
     json.push_str("\"pawn\":{");
     json.push_str(&format!(
@@ -633,6 +663,36 @@ fn parse_command(line: &str) -> Option<Command> {
     if !trimmed.starts_with('{') {
         return None;
     }
+    if let Some(cmd_type) = extract_string(trimmed, "\"type\"") {
+        match cmd_type.as_str() {
+            "set_time_scale" => return parse_time_scale_command(trimmed).map(Command::SetTimeScale),
+            "move_pawn" => {
+                let dx = extract_number::<i32>(trimmed, "\"dx\"")?;
+                let dy = extract_number::<i32>(trimmed, "\"dy\"")?;
+                return Some(Command::MovePawn { dx, dy });
+            }
+            "toggle_sleep" => return Some(Command::ToggleSleep),
+            "interact_at" => {
+                let x = extract_number::<u32>(trimmed, "\"x\"")?;
+                let y = extract_number::<u32>(trimmed, "\"y\"")?;
+                return Some(Command::InteractAt { x, y });
+            }
+            "device_action" => {
+                let device_id = extract_number::<u64>(trimmed, "\"device_id\"")?;
+                let action = extract_string(trimmed, "\"action\"")?;
+                let action = match action.to_ascii_lowercase().as_str() {
+                    "toggle" => DeviceAction::Toggle,
+                    _ => return None,
+                };
+                return Some(Command::DeviceAction { device_id, action });
+            }
+            "ship_computer_toggle" => {
+                let device_id = extract_number::<u64>(trimmed, "\"device_id\"")?;
+                return Some(Command::ShipComputerToggle { device_id });
+            }
+            _ => {}
+        }
+    }
     if trimmed.contains("set_time_scale") {
         return parse_time_scale_command(trimmed).map(Command::SetTimeScale);
     }
@@ -676,9 +736,24 @@ fn extract_number<T: core::str::FromStr>(line: &str, key: &str) -> Option<T> {
     value_str.parse::<T>().ok()
 }
 
+fn extract_string(line: &str, key: &str) -> Option<String> {
+    let start = line.find(key)? + key.len();
+    let after_key = line.get(start..)?;
+    let colon_index = after_key.find(':')?;
+    let after_colon = after_key.get(colon_index + 1..)?.trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let rest = &after_colon[1..];
+    let end_index = rest.find('"')?;
+    Some(rest[..end_index].to_string())
+}
+
 enum Command {
     SetTimeScale(f64),
     MovePawn { dx: i32, dy: i32 },
     ToggleSleep,
     InteractAt { x: u32, y: u32 },
+    DeviceAction { device_id: u64, action: DeviceAction },
+    ShipComputerToggle { device_id: u64 },
 }

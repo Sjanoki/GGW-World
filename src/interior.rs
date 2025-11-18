@@ -240,6 +240,43 @@ pub struct PowerState {
     pub total_consumption_kw: f32,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ShipPowerSummary {
+    pub generation_kw: f32,
+    pub load_kw: f32,
+    pub net_kw: f32,
+    pub devices: Vec<DevicePowerStatus>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DevicePowerStatus {
+    pub id: u64,
+    pub name: String,
+    pub group: DevicePowerGroup,
+    pub draw_kw: f32,
+    pub online: bool,
+    pub controllable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DevicePowerGroup {
+    Reactor,
+    LifeSupport,
+    NavComms,
+    Misc,
+}
+
+impl DevicePowerGroup {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DevicePowerGroup::Reactor => "Reactor",
+            DevicePowerGroup::LifeSupport => "Life Support",
+            DevicePowerGroup::NavComms => "Nav & Comms",
+            DevicePowerGroup::Misc => "Misc",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceType {
     Tank,
@@ -453,6 +490,7 @@ pub struct ShipInterior {
     pub tiles: Vec<Tile>,
     pub tile_atmos: Vec<TileAtmosphere>,
     pub power: PowerState,
+    pub power_summary: ShipPowerSummary,
     pub devices: Vec<Device>,
     pub hull_shape: HullShape,
 }
@@ -498,26 +536,11 @@ impl ShipInterior {
         let mut devices = Vec::new();
         let mut next_id = 1u64;
 
-        let nav_power = config
-            .items
-            .get("nav_station")
-            .map(|item| item.idle_power_kw)
-            .unwrap_or(1.5);
-        let ship_computer_power = config
-            .items
-            .get("ship_computer")
-            .map(|item| item.idle_power_kw)
-            .unwrap_or(2.5);
-        let transponder_power = config
-            .items
-            .get("transponder")
-            .map(|item| item.idle_power_kw)
-            .unwrap_or(5.0);
-        let light_power = config
-            .items
-            .get("light")
-            .map(|item| item.idle_power_kw)
-            .unwrap_or(1.0);
+        let power_cfg = &config.power;
+        let nav_power = power_cfg.nav_station_kw;
+        let ship_computer_power = power_cfg.ship_computer_kw;
+        let transponder_power = power_cfg.transponder_kw;
+        let light_power = power_cfg.light_kw;
         let dispenser_rate = config
             .items
             .get("dispenser")
@@ -537,18 +560,19 @@ impl ShipInterior {
             y: 2,
             w: 3,
             h: 3,
-            power_kw: 0.0,
+            power_kw: -power_cfg.reactor_output_kw,
             online: true,
             data: DeviceData::Reactor(ReactorData {
                 fuel_kg: 100.0,
                 max_fuel_kg: 100.0,
                 fuel_burn_rate_kg_per_s: 0.0005,
-                power_output_kw: 500.0,
+                power_output_kw: power_cfg.reactor_output_kw,
                 online: true,
             }),
         });
         next_id += 1;
 
+        let tank_defaults = &config.default_tank;
         devices.push(Device {
             id: next_id,
             device_type: DeviceType::Tank,
@@ -560,9 +584,9 @@ impl ShipInterior {
             online: true,
             data: DeviceData::Tank(TankData {
                 capacity_kg: 200.0,
-                o2_kg: 80.0,
-                n2_kg: 100.0,
-                co2_kg: 5.0,
+                o2_kg: tank_defaults.o2_mass_kg,
+                n2_kg: tank_defaults.n2_mass_kg,
+                co2_kg: tank_defaults.co2_mass_kg,
                 xenon_kg: 10.0,
             }),
         });
@@ -576,11 +600,7 @@ impl ShipInterior {
             y: 4,
             w: 1,
             h: 1,
-            power_kw: config
-                .items
-                .get("dispenser")
-                .map(|item| item.idle_power_kw)
-                .unwrap_or(2.0),
+            power_kw: power_cfg.dispenser_kw,
             online: true,
             data: DeviceData::Dispenser(DispenserData {
                 active: true,
@@ -657,7 +677,7 @@ impl ShipInterior {
             y: 2,
             w: 2,
             h: 1,
-            power_kw: 0.0,
+            power_kw: power_cfg.bed_kw,
             online: true,
             data: DeviceData::BedDevice(BedDeviceData {}),
         });
@@ -670,7 +690,7 @@ impl ShipInterior {
             y: door_y,
             w: 1,
             h: 1,
-            power_kw: 0.0,
+            power_kw: power_cfg.door_kw,
             online: true,
             data: DeviceData::DoorDevice(DoorDeviceData { open: true }),
         });
@@ -683,7 +703,7 @@ impl ShipInterior {
             y: 2,
             w: 1,
             h: 1,
-            power_kw: 3.0,
+            power_kw: power_cfg.food_generator_kw,
             online: true,
             data: DeviceData::FoodGenerator(FoodGeneratorData {
                 food_units: 5.0,
@@ -698,12 +718,14 @@ impl ShipInterior {
             tiles,
             tile_atmos,
             power,
+            power_summary: ShipPowerSummary::default(),
             devices,
             hull_shape: HullShape {
                 vertices: Vec::new(),
             },
         };
         ship.rebuild_hull_shape();
+        ship.rebuild_power_summary(config);
         ship
     }
 
@@ -944,7 +966,7 @@ impl ShipInterior {
         )
     }
 
-    pub fn step(&mut self, dt: f64) {
+    pub fn step(&mut self, dt: f64, config: &GameConfig) {
         self.power.total_production_kw = 0.0;
         self.power.total_consumption_kw = 0.0;
         let dt_f32 = dt as f32;
@@ -1026,6 +1048,88 @@ impl ShipInterior {
         }
 
         self.power.net_kw = self.power.total_production_kw - self.power.total_consumption_kw;
+        self.rebuild_power_summary(config);
+    }
+
+    fn rebuild_power_summary(&mut self, config: &GameConfig) {
+        let mut summary = ShipPowerSummary::default();
+        summary.generation_kw = self.power.total_production_kw;
+        summary.load_kw = self.power.total_consumption_kw;
+        summary.net_kw = self.power.net_kw;
+        summary.devices.reserve(self.devices.len());
+        for device in &self.devices {
+            let Some(group) = device_power_group(device.device_type) else {
+                continue;
+            };
+            let draw_kw = device.power_kw.abs();
+            let name = if let Some(key) = device.device_type.config_key() {
+                config
+                    .items
+                    .get(key)
+                    .map(|item| item.display_name.clone())
+                    .unwrap_or_else(|| device.device_type.as_str().to_string())
+            } else {
+                device.device_type.as_str().to_string()
+            };
+            summary.devices.push(DevicePowerStatus {
+                id: device.id,
+                name,
+                group,
+                draw_kw,
+                online: device.online,
+                controllable: ship_computer_controllable(device.device_type),
+            });
+        }
+        self.power_summary = summary;
+    }
+
+    pub fn handle_device_action(&mut self, device_id: u64, action: DeviceAction) {
+        if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+            match (&mut device.data, action) {
+                (DeviceData::Reactor(data), DeviceAction::Toggle) => {
+                    if data.fuel_kg > 0.0 {
+                        data.online = !data.online;
+                        device.online = data.online;
+                    }
+                }
+                (DeviceData::Dispenser(data), DeviceAction::Toggle) => {
+                    data.active = !data.active;
+                    device.online = data.active;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn toggle_device_from_computer(&mut self, device_id: u64) {
+        if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+            if !ship_computer_controllable(device.device_type) {
+                return;
+            }
+            let new_state = !device.online;
+            match &mut device.data {
+                DeviceData::NavStation(data) => {
+                    data.online = new_state;
+                }
+                DeviceData::Transponder(data) => {
+                    data.online = new_state;
+                }
+                DeviceData::ShipComputer(data) => {
+                    data.online = new_state;
+                }
+                DeviceData::Dispenser(data) => {
+                    data.active = new_state;
+                }
+                DeviceData::FoodGenerator(data) => {
+                    data.online = new_state;
+                }
+                DeviceData::Light(data) => {
+                    data.online = new_state;
+                }
+                _ => {}
+            }
+            device.online = new_state;
+        }
     }
 
     pub fn step_atmosphere(&mut self, dt: f32) {
@@ -1114,7 +1218,7 @@ impl InteriorWorld {
 
     pub fn step(&mut self, dt: f64, config: &GameConfig) {
         self.process_commands(config);
-        self.ship.step(dt);
+        self.ship.step(dt, config);
         self.update_pawn_needs(dt);
         self.atmos_accumulator += dt;
         let tick = config.atmosphere.tick_interval_s as f64;
@@ -1140,6 +1244,12 @@ impl InteriorWorld {
                 }
                 InteriorCommand::InteractAt { x, y } => {
                     self.interact_at(x, y, &config.atmosphere);
+                }
+                InteriorCommand::DeviceAction { device_id, action } => {
+                    self.ship.handle_device_action(device_id, action);
+                }
+                InteriorCommand::ShipComputerToggle { device_id } => {
+                    self.ship.toggle_device_from_computer(device_id);
                 }
             }
         }
@@ -1199,22 +1309,18 @@ impl InteriorWorld {
                     data.online = !data.online;
                     device.online = data.online;
                 }
-                DeviceData::Reactor(data) => {
-                    if data.fuel_kg > 0.0 {
-                        data.online = !data.online;
-                        device.online = data.online;
-                    }
-                }
                 DeviceData::Dispenser(data) => {
                     data.active = !data.active;
+                    device.online = data.active;
                 }
                 DeviceData::FoodGenerator(data) => {
                     if data.food_units > 0.0 {
                         let consumed = data.food_units.min(1.0);
                         data.food_units -= consumed;
-                        self.pawn.needs.hunger = (self.pawn.needs.hunger - 0.2).max(0.0);
-                        self.pawn.needs.clamp();
                     }
+                    self.pawn.needs.hunger = (self.pawn.needs.hunger - 0.25).max(0.0);
+                    self.pawn.needs.thirst = (self.pawn.needs.thirst + 0.05).min(1.0);
+                    self.pawn.needs.clamp();
                 }
                 _ => {}
             }
@@ -1305,10 +1411,41 @@ pub enum InteriorCommand {
     MovePawn { dx: i32, dy: i32 },
     ToggleSleep,
     InteractAt { x: u32, y: u32 },
+    DeviceAction { device_id: u64, action: DeviceAction },
+    ShipComputerToggle { device_id: u64 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DeviceAction {
+    Toggle,
 }
 
 fn device_contains(device: &Device, x: u32, y: u32) -> bool {
     x >= device.x && y >= device.y && x < device.x + device.w && y < device.y + device.h
+}
+
+fn device_power_group(device_type: DeviceType) -> Option<DevicePowerGroup> {
+    match device_type {
+        DeviceType::ReactorUranium => Some(DevicePowerGroup::Reactor),
+        DeviceType::Dispenser | DeviceType::FoodGenerator => Some(DevicePowerGroup::LifeSupport),
+        DeviceType::NavStation | DeviceType::Transponder | DeviceType::ShipComputer => {
+            Some(DevicePowerGroup::NavComms)
+        }
+        DeviceType::Light => Some(DevicePowerGroup::Misc),
+        _ => None,
+    }
+}
+
+fn ship_computer_controllable(device_type: DeviceType) -> bool {
+    matches!(
+        device_type,
+        DeviceType::NavStation
+            | DeviceType::Transponder
+            | DeviceType::ShipComputer
+            | DeviceType::Dispenser
+            | DeviceType::FoodGenerator
+            | DeviceType::Light
+    )
 }
 
 impl TileType {
@@ -1341,6 +1478,22 @@ impl DeviceType {
             DeviceType::DoorDevice => "DoorDevice",
             DeviceType::PowerLine => "PowerLine",
             DeviceType::GasLine => "GasLine",
+        }
+    }
+
+    pub fn config_key(&self) -> Option<&'static str> {
+        match self {
+            DeviceType::Tank => Some("tank"),
+            DeviceType::ReactorUranium => Some("reactor_uranium"),
+            DeviceType::Dispenser => Some("dispenser"),
+            DeviceType::NavStation => Some("nav_station"),
+            DeviceType::Transponder => Some("transponder"),
+            DeviceType::ShipComputer => Some("ship_computer"),
+            DeviceType::BedDevice => Some("bed"),
+            DeviceType::FoodGenerator => Some("food_generator"),
+            DeviceType::Light => Some("light"),
+            DeviceType::DoorDevice => Some("door"),
+            _ => None,
         }
     }
 }
@@ -1502,6 +1655,50 @@ mod tests {
         for x in nav.x..nav.x + nav.w {
             assert!(interior.ship.is_passable(x as i32, front_y as i32));
         }
+    }
+
+    #[test]
+    fn ship_computer_toggle_updates_power_summary() {
+        let (mut interior, config) = make_interior();
+        let nav_id = interior
+            .ship
+            .devices
+            .iter()
+            .find(|device| device.device_type == DeviceType::NavStation)
+            .map(|device| device.id)
+            .expect("nav id");
+        let reactor_id = interior
+            .ship
+            .devices
+            .iter()
+            .find(|device| device.device_type == DeviceType::ReactorUranium)
+            .map(|device| device.id)
+            .expect("reactor id");
+        let initial_net = interior.ship.power.net_kw;
+        interior.queue_command(InteriorCommand::ShipComputerToggle { device_id: nav_id });
+        interior.step(config.atmosphere.tick_interval_s as f64, &config);
+        let nav_online = interior
+            .ship
+            .devices
+            .iter()
+            .find(|device| device.id == nav_id)
+            .map(|device| device.online)
+            .unwrap_or(true);
+        assert!(!nav_online, "NavStation should toggle offline via ship computer");
+        assert!(interior.ship.power.net_kw > initial_net);
+
+        interior.queue_command(InteriorCommand::ShipComputerToggle {
+            device_id: reactor_id,
+        });
+        interior.step(config.atmosphere.tick_interval_s as f64, &config);
+        let reactor_online = interior
+            .ship
+            .devices
+            .iter()
+            .find(|device| device.id == reactor_id)
+            .map(|device| device.online)
+            .unwrap_or(false);
+        assert!(reactor_online, "Reactor should ignore ship-computer toggles");
     }
 
     #[test]
