@@ -49,8 +49,6 @@ INTERACTIVE_MODAL_KINDS = {
     "NavStation",
     "Transponder",
     "ShipComputer",
-    "Dispenser",
-    "FoodGenerator",
 }
 
 MOVE_KEYS = {
@@ -266,7 +264,7 @@ def build_tile_context_lines(
     lines = [f"Pos: ({pos[0]}, {pos[1]})"]
     if tile_type == "Wall":
         lines.append("Standard wall. No atmosphere sample.")
-        return lines, "Wall"
+        return lines, "Standard Wall"
     atmo_lines = build_atmo_lines(tile_info.get("atmos"))
     if atmo_lines:
         lines.extend(atmo_lines)
@@ -543,12 +541,9 @@ def build_modal_content(device: Dict, snapshot: Dict) -> Tuple[str, List[str], L
     elif kind == "NavStation":
         nav = nav_stats(snapshot)
         if nav:
-            lines.append(f"Alt: {format_distance(nav['altitude'])}")
-            lines.append(f"Ap: {format_distance(nav['apoapsis'])}")
-            lines.append(f"Pe: {format_distance(nav['periapsis'])}")
-            lines.append(f"Speed: {nav['speed'] / 1000:.2f} km/s")
-            lines.append(f"Period: {nav['period'] / 3600:.2f} h")
-            lines.append(f"Heading: {nav['heading']}")
+            if lines and lines[-1] != "":
+                lines.append("")
+            lines.extend(build_nav_ascii_panel(nav))
         else:
             lines.append("Nav data unavailable")
     elif kind == "ShipComputer":
@@ -778,6 +773,36 @@ def nav_stats(snapshot: Dict) -> Optional[Dict[str, float]]:
         "period": period,
         "heading": heading,
     }
+
+
+def build_nav_ascii_panel(nav: Dict[str, float]) -> List[str]:
+    grid_size = 9
+    grid = [["." for _ in range(grid_size)] for _ in range(grid_size)]
+    center = grid_size // 2
+    for idx in range(grid_size):
+        grid[center][idx] = "-"
+        grid[idx][center] = "|"
+    grid[center][center] = "O"
+
+    apo = max(nav.get("apoapsis", 1.0), 1.0)
+    altitude = max(nav.get("altitude", 0.0), 0.0)
+    ratio = 0.0 if apo <= 0.0 else clamp(altitude / apo, 0.0, 1.0)
+    ship_row = max(0, min(grid_size - 1, center - int(ratio * center)))
+    grid[ship_row][center] = "A"
+
+    ascii_block = ["+--------- ASCII RADAR ---------+"]
+    for row in grid:
+        ascii_block.append("| " + "".join(row) + " |")
+    ascii_block.append("+--------------------------------+")
+    ascii_block.append(f"COMMS LINK: ACTIVE :: {nav.get('heading', 'Unknown')}")
+    ascii_block.append(
+        f"ALT {format_distance(nav.get('altitude', 0.0))}  SPD {nav.get('speed', 0.0) / 1000:.2f} km/s"
+    )
+    ascii_block.append(
+        f"AP  {format_distance(nav.get('apoapsis', 0.0))}  PE  {format_distance(nav.get('periapsis', 0.0))}"
+    )
+    ascii_block.append(f"ORB PERIOD {nav.get('period', 0.0) / 3600:.2f} h")
+    return ascii_block
 
 
 def build_device_lines(device: Dict) -> List[str]:
