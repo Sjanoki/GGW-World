@@ -2,6 +2,23 @@ use std::collections::VecDeque;
 
 use crate::{HullShape, Vec2, TILE_SIZE_METERS};
 
+const KPA_PER_KG: f32 = 100.0;
+const STANDARD_PRESSURE_KPA: f32 = 101.0;
+const STANDARD_O2_FRACTION: f32 = 0.21;
+const STANDARD_N2_FRACTION: f32 = 0.78;
+const STANDARD_CO2_FRACTION: f32 = 0.01;
+const ATMOS_DIFFUSION_COEFF: f32 = 0.4;
+const ATMOS_DIFFUSION_MAX_FRACTION: f32 = 0.5;
+pub const ATMOS_TICK_HZ: f32 = 6.0;
+pub const ATMOS_DT: f32 = 1.0 / ATMOS_TICK_HZ;
+const O2_CONSUMPTION_KG_PER_SEC: f32 = 0.0003;
+const CO2_PRODUCTION_KG_PER_SEC: f32 = 0.0003;
+const LOW_PRESSURE_THRESHOLD_KPA: f32 = 70.0;
+const LOW_O2_FRACTION: f32 = 0.16;
+const HIGH_CO2_FRACTION: f32 = 0.08;
+const SUFFOCATION_DAMAGE_PER_SEC: f32 = 2.0;
+const VACUUM_DAMAGE_PER_SEC: f32 = 8.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileType {
     Empty,
@@ -56,8 +73,7 @@ impl AtmosCell {
     }
 
     pub fn sample(&self) -> AtmosSample {
-        const KPA_PER_KG: f32 = 0.5;
-        let total = self.o2_kg + self.n2_kg + self.co2_kg;
+        let total = self.total_mass();
         if total <= f32::EPSILON {
             return AtmosSample::default();
         }
@@ -66,6 +82,52 @@ impl AtmosCell {
             o2_fraction: (self.o2_kg / total).clamp(0.0, 1.0),
             n2_fraction: (self.n2_kg / total).clamp(0.0, 1.0),
             co2_fraction: (self.co2_kg / total).clamp(0.0, 1.0),
+        }
+    }
+
+    pub fn total_mass(&self) -> f32 {
+        self.o2_kg + self.n2_kg + self.co2_kg
+    }
+
+    pub fn add_gas(&mut self, gas: GasType, mass: f32) {
+        if mass <= 0.0 {
+            return;
+        }
+        match gas {
+            GasType::O2 => self.o2_kg += mass,
+            GasType::N2 => self.n2_kg += mass,
+            GasType::CO2 => self.co2_kg += mass,
+            GasType::Xenon => {}
+        }
+    }
+
+    pub fn clamp_non_negative(&mut self) {
+        self.o2_kg = self.o2_kg.max(0.0);
+        self.n2_kg = self.n2_kg.max(0.0);
+        self.co2_kg = self.co2_kg.max(0.0);
+        if self.total_mass() < 1e-6 {
+            self.o2_kg = 0.0;
+            self.n2_kg = 0.0;
+            self.co2_kg = 0.0;
+        }
+    }
+
+    pub fn with_standard_air() -> Self {
+        let total = STANDARD_PRESSURE_KPA / KPA_PER_KG;
+        Self {
+            o2_kg: total * STANDARD_O2_FRACTION,
+            n2_kg: total * STANDARD_N2_FRACTION,
+            co2_kg: total * STANDARD_CO2_FRACTION,
+        }
+    }
+}
+
+impl Default for AtmosCell {
+    fn default() -> Self {
+        Self {
+            o2_kg: 0.0,
+            n2_kg: 0.0,
+            co2_kg: 0.0,
         }
     }
 }
@@ -161,6 +223,7 @@ pub struct NavStationData {
 pub struct TransponderData {
     pub callsign: String,
     pub online: bool,
+    pub dm_code: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +306,7 @@ pub struct Pawn {
     pub status: PawnStatus,
     pub needs: NeedsState,
     pub health: HealthState,
+    pub suffocation_time: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -286,7 +350,7 @@ pub struct ShipInterior {
     pub width: u32,
     pub height: u32,
     pub tiles: Vec<Tile>,
-    pub atmos: AtmosCell,
+    pub tile_atmos: Vec<AtmosCell>,
     pub power: PowerState,
     pub devices: Vec<Device>,
     pub hull_shape: HullShape,
@@ -318,7 +382,15 @@ impl ShipInterior {
         tiles[Self::idx(2, 2, width)].tile_type = TileType::Bed;
         tiles[Self::idx(3, 2, width)].tile_type = TileType::Bed;
 
-        let atmos = AtmosCell::new(50.0, 150.0, 0.5);
+        let mut tile_atmos = vec![AtmosCell::default(); (width * height) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = Self::idx(x, y, width);
+                if Self::tile_supports_atmos(tiles[idx].tile_type) {
+                    tile_atmos[idx] = AtmosCell::with_standard_air();
+                }
+            }
+        }
         let power = PowerState::default();
         let mut devices = Vec::new();
         let mut next_id = 1u64;
@@ -408,6 +480,7 @@ impl ShipInterior {
             data: DeviceData::Transponder(TransponderData {
                 callsign: "GGW-TEST".to_string(),
                 online: true,
+                dm_code: 4242,
             }),
         });
         next_id += 1;
@@ -484,7 +557,7 @@ impl ShipInterior {
             width,
             height,
             tiles,
-            atmos,
+            tile_atmos,
             power,
             devices,
             hull_shape: HullShape {
@@ -520,7 +593,7 @@ impl ShipInterior {
     fn tile_supports_atmos(tile_type: TileType) -> bool {
         matches!(
             tile_type,
-            TileType::Floor | TileType::Bed | TileType::DoorOpen
+            TileType::Floor | TileType::Bed | TileType::DoorOpen | TileType::DoorClosed
         )
     }
 
@@ -532,7 +605,30 @@ impl ShipInterior {
         if !Self::tile_supports_atmos(tile_type) {
             return None;
         }
-        Some(self.atmos.sample())
+        let idx = Self::idx(x, y, self.width);
+        Some(self.tile_atmos[idx].sample())
+    }
+
+    pub fn tile_atmos_cell(&self, x: u32, y: u32) -> Option<&AtmosCell> {
+        if !self.in_bounds(x as i32, y as i32) {
+            return None;
+        }
+        if !Self::tile_supports_atmos(self.tile_type(x, y)) {
+            return None;
+        }
+        let idx = Self::idx(x, y, self.width);
+        Some(&self.tile_atmos[idx])
+    }
+
+    pub fn tile_atmos_cell_mut(&mut self, x: u32, y: u32) -> Option<&mut AtmosCell> {
+        if !self.in_bounds(x as i32, y as i32) {
+            return None;
+        }
+        if !Self::tile_supports_atmos(self.tile_type(x, y)) {
+            return None;
+        }
+        let idx = Self::idx(x, y, self.width);
+        Some(&mut self.tile_atmos[idx])
     }
 
     pub fn is_passable(&self, x: i32, y: i32) -> bool {
@@ -549,6 +645,50 @@ impl ShipInterior {
         if x < self.width && y < self.height {
             let idx = Self::idx(x, y, self.width);
             self.tiles[idx].tile_type = tile_type;
+            if !Self::tile_supports_atmos(tile_type) {
+                self.tile_atmos[idx] = AtmosCell::default();
+            } else if self.tile_atmos[idx].total_mass() <= f32::EPSILON {
+                self.tile_atmos[idx] = AtmosCell::with_standard_air();
+            }
+        }
+    }
+
+    pub fn total_atmos(&self) -> AtmosCell {
+        let mut total = AtmosCell::default();
+        for cell in &self.tile_atmos {
+            total.o2_kg += cell.o2_kg;
+            total.n2_kg += cell.n2_kg;
+            total.co2_kg += cell.co2_kg;
+        }
+        total
+    }
+
+    fn pick_device_output_tile(&self, rect: (u32, u32, u32, u32)) -> Option<(u32, u32)> {
+        let (x, y, w, h) = rect;
+        let front_y = y + h;
+        if front_y < self.height {
+            for tx in x..(x + w).min(self.width) {
+                if Self::tile_supports_atmos(self.tile_type(tx, front_y)) {
+                    return Some((tx, front_y));
+                }
+            }
+        }
+        for ty in y..(y + h).min(self.height) {
+            for tx in x..(x + w).min(self.width) {
+                if Self::tile_supports_atmos(self.tile_type(tx, ty)) {
+                    return Some((tx, ty));
+                }
+            }
+        }
+        None
+    }
+
+    fn inject_gas_into_tile(&mut self, x: u32, y: u32, gas: GasType, mass: f32) {
+        if mass <= 0.0 {
+            return;
+        }
+        if let Some(cell) = self.tile_atmos_cell_mut(x, y) {
+            cell.add_gas(gas, mass);
         }
     }
 
@@ -663,6 +803,8 @@ impl ShipInterior {
         for idx in 0..device_count {
             let (before, rest) = self.devices.split_at_mut(idx);
             let (device, after) = rest.split_first_mut().expect("split_first");
+            let device_rect = (device.x, device.y, device.w, device.h);
+            let mut pending_injection: Option<((u32, u32, u32, u32), GasType, f32)> = None;
 
             if device.online && device.power_kw > 0.0 {
                 self.power.total_consumption_kw += device.power_kw;
@@ -694,26 +836,30 @@ impl ShipInterior {
                         let mut iter = before.iter_mut().chain(after.iter_mut());
                         if let Some(tank_device) = iter.find(|d| d.id == tank_id) {
                             if let DeviceData::Tank(tank) = &mut tank_device.data {
-                                match data.gas_type {
+                                let moved = match data.gas_type {
                                     GasType::O2 => {
                                         let moved = tank.o2_kg.min(transfer);
                                         tank.o2_kg -= moved;
-                                        self.atmos.o2_kg += moved;
+                                        moved
                                     }
                                     GasType::N2 => {
                                         let moved = tank.n2_kg.min(transfer);
                                         tank.n2_kg -= moved;
-                                        self.atmos.n2_kg += moved;
+                                        moved
                                     }
                                     GasType::CO2 => {
                                         let moved = tank.co2_kg.min(transfer);
                                         tank.co2_kg -= moved;
-                                        self.atmos.co2_kg += moved;
+                                        moved
                                     }
                                     GasType::Xenon => {
                                         let moved = tank.xenon_kg.min(transfer);
                                         tank.xenon_kg -= moved;
+                                        0.0
                                     }
+                                };
+                                if moved > 0.0 {
+                                    pending_injection = Some((device_rect, data.gas_type, moved));
                                 }
                             }
                         }
@@ -721,9 +867,65 @@ impl ShipInterior {
                 }
                 _ => {}
             }
+
+            if let Some((rect, gas, mass)) = pending_injection.take() {
+                if let Some((tx, ty)) = self.pick_device_output_tile(rect) {
+                    self.inject_gas_into_tile(tx, ty, gas, mass);
+                }
+            }
         }
 
         self.power.net_kw = self.power.total_production_kw - self.power.total_consumption_kw;
+    }
+
+    pub fn step_atmosphere(&mut self, dt: f32) {
+        if dt <= 0.0 {
+            return;
+        }
+        let width = self.width as i32;
+        let height = self.height as i32;
+        let factor = (ATMOS_DIFFUSION_COEFF * dt).min(ATMOS_DIFFUSION_MAX_FRACTION);
+        if factor <= 0.0 {
+            return;
+        }
+        let mut deltas = vec![AtmosCell::default(); self.tile_atmos.len()];
+        const NEIGHBORS: &[(i32, i32)] = &[(1, 0), (0, 1), (1, 1), (-1, 1)];
+        for y in 0..height {
+            for x in 0..width {
+                let idx_a = Self::idx(x as u32, y as u32, self.width);
+                if !Self::tile_supports_atmos(self.tiles[idx_a].tile_type) {
+                    continue;
+                }
+                for (dx, dy) in NEIGHBORS {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= width || ny >= height {
+                        continue;
+                    }
+                    let idx_b = Self::idx(nx as u32, ny as u32, self.width);
+                    if !Self::tile_supports_atmos(self.tiles[idx_b].tile_type) {
+                        continue;
+                    }
+                    let cell_a = self.tile_atmos[idx_a].clone();
+                    let cell_b = self.tile_atmos[idx_b].clone();
+                    let delta_o2 = (cell_b.o2_kg - cell_a.o2_kg) * factor;
+                    let delta_n2 = (cell_b.n2_kg - cell_a.n2_kg) * factor;
+                    let delta_co2 = (cell_b.co2_kg - cell_a.co2_kg) * factor;
+                    deltas[idx_a].o2_kg += delta_o2;
+                    deltas[idx_b].o2_kg -= delta_o2;
+                    deltas[idx_a].n2_kg += delta_n2;
+                    deltas[idx_b].n2_kg -= delta_n2;
+                    deltas[idx_a].co2_kg += delta_co2;
+                    deltas[idx_b].co2_kg -= delta_co2;
+                }
+            }
+        }
+        for (cell, delta) in self.tile_atmos.iter_mut().zip(deltas.into_iter()) {
+            cell.o2_kg += delta.o2_kg;
+            cell.n2_kg += delta.n2_kg;
+            cell.co2_kg += delta.co2_kg;
+            cell.clamp_non_negative();
+        }
     }
 }
 
@@ -732,6 +934,7 @@ pub struct InteriorWorld {
     pub ship: ShipInterior,
     pub pawn: Pawn,
     command_queue: VecDeque<InteriorCommand>,
+    atmos_accumulator: f64,
 }
 
 impl InteriorWorld {
@@ -745,11 +948,13 @@ impl InteriorWorld {
             status: PawnStatus::Awake,
             needs: NeedsState::new(),
             health: HealthState::new_default(),
+            suffocation_time: 0.0,
         };
         Self {
             ship,
             pawn,
             command_queue: VecDeque::new(),
+            atmos_accumulator: 0.0,
         }
     }
 
@@ -761,6 +966,12 @@ impl InteriorWorld {
         self.process_commands();
         self.ship.step(dt);
         self.update_pawn_needs(dt);
+        self.atmos_accumulator += dt;
+        while self.atmos_accumulator >= ATMOS_DT as f64 {
+            self.ship.step_atmosphere(ATMOS_DT);
+            self.apply_pawn_atmos_effects(ATMOS_DT);
+            self.atmos_accumulator -= ATMOS_DT as f64;
+        }
     }
 
     fn process_commands(&mut self) {
@@ -879,6 +1090,57 @@ impl InteriorWorld {
         }
         self.pawn.needs.clamp();
     }
+
+    fn apply_pawn_atmos_effects(&mut self, dt: f32) {
+        let mut suffocating = false;
+        if let Some(cell) = self.ship.tile_atmos_cell_mut(self.pawn.x, self.pawn.y) {
+            let required_o2 = O2_CONSUMPTION_KG_PER_SEC * dt;
+            let available_o2 = cell.o2_kg;
+            let consumed = available_o2.min(required_o2);
+            cell.o2_kg -= consumed;
+            let production_scale = if required_o2 > 0.0 {
+                consumed / required_o2
+            } else {
+                0.0
+            };
+            cell.co2_kg += CO2_PRODUCTION_KG_PER_SEC * dt * production_scale;
+            if consumed < required_o2 * 0.9 {
+                suffocating = true;
+            }
+            let sample = cell.sample();
+            let mut damage = 0.0;
+            if sample.pressure_kpa < LOW_PRESSURE_THRESHOLD_KPA {
+                damage += (LOW_PRESSURE_THRESHOLD_KPA - sample.pressure_kpa) * 0.005 * dt;
+            }
+            if sample.o2_fraction < LOW_O2_FRACTION {
+                damage += (LOW_O2_FRACTION - sample.o2_fraction) * 5.0 * dt;
+            }
+            if sample.co2_fraction > HIGH_CO2_FRACTION {
+                damage += (sample.co2_fraction - HIGH_CO2_FRACTION) * 5.0 * dt;
+            }
+            if damage > 0.0 {
+                self.apply_health_damage(damage);
+            }
+        } else {
+            suffocating = true;
+            self.apply_health_damage(VACUUM_DAMAGE_PER_SEC * dt);
+        }
+        if suffocating {
+            self.pawn.suffocation_time += dt;
+            self.apply_health_damage(SUFFOCATION_DAMAGE_PER_SEC * dt);
+        } else {
+            self.pawn.suffocation_time = 0.0;
+        }
+    }
+
+    fn apply_health_damage(&mut self, amount: f32) {
+        if amount <= 0.0 {
+            return;
+        }
+        for part in &mut self.pawn.health.body_parts {
+            part.hp = (part.hp - amount).max(0.0);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -961,9 +1223,65 @@ mod tests {
     #[test]
     fn dispenser_moves_gas_from_tank_to_atmos() {
         let mut interior = InteriorWorld::new_test_ship();
-        let initial_o2 = interior.ship.atmos.o2_kg;
+        let initial_o2 = interior.ship.total_atmos().o2_kg;
         interior.step(10.0);
-        assert!(interior.ship.atmos.o2_kg > initial_o2);
+        assert!(interior.ship.total_atmos().o2_kg > initial_o2);
+    }
+
+    #[test]
+    fn atmos_diffusion_conserves_mass() {
+        let mut interior = InteriorWorld::new_test_ship();
+        for cell in &mut interior.ship.tile_atmos {
+            *cell = AtmosCell::default();
+        }
+        if let Some(cell) = interior.ship.tile_atmos_cell_mut(5, 3) {
+            cell.co2_kg = 1.0;
+        }
+        let total_before: f32 = interior.ship.tile_atmos.iter().map(|c| c.co2_kg).sum();
+        for _ in 0..24 {
+            interior.ship.step_atmosphere(ATMOS_DT);
+        }
+        let total_after: f32 = interior.ship.tile_atmos.iter().map(|c| c.co2_kg).sum();
+        assert!((total_before - total_after).abs() < 1e-5);
+        let spread = interior
+            .ship
+            .tile_atmos
+            .iter()
+            .filter(|c| c.co2_kg > 0.0)
+            .count();
+        assert!(spread > 1);
+    }
+
+    #[test]
+    fn pawn_breathing_consumes_o2() {
+        let mut interior = InteriorWorld::new_test_ship();
+        if let Some(device) = interior
+            .ship
+            .devices
+            .iter_mut()
+            .find(|d| matches!(d.data, DeviceData::Dispenser(_)))
+        {
+            if let DeviceData::Dispenser(data) = &mut device.data {
+                data.active = false;
+            }
+        }
+        let pawn_x = interior.pawn.x;
+        let pawn_y = interior.pawn.y;
+        let initial = interior
+            .ship
+            .tile_atmos_cell(pawn_x, pawn_y)
+            .map(|cell| (cell.o2_kg, cell.co2_kg))
+            .expect("pawn tile atmos");
+        for _ in 0..30 {
+            interior.step(ATMOS_DT as f64);
+        }
+        let after = interior
+            .ship
+            .tile_atmos_cell(pawn_x, pawn_y)
+            .map(|cell| (cell.o2_kg, cell.co2_kg))
+            .expect("pawn tile atmos");
+        assert!(after.0 < initial.0);
+        assert!(after.1 > initial.1);
     }
 
     #[test]

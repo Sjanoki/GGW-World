@@ -1,24 +1,19 @@
 # Phase 2 Validation – Interior Simulation Layer
 
-This document captures the results of validating the merged Phase 2 features and serves as the hand-off for Phase 3.
+Phase 2 focuses on the playable ship interior, atmosphere simulation, and the interactive device UIs that hook into the shared server. The current build verifies the following items.
 
 ## ✅ Confirmed Functionality
-- **Shared dedicated server** – Both the interior and orbital viewers now connect to a single running `ggw_world` server over TCP (`127.0.0.1:40000`). No viewer attempts to spawn its own simulation instance. 【F:admin_orbit_viewer.py†L1-L313】【F:interior_viewer.py†L1-L720】
-- **Interior viewer polish** – The 4-circle pawn rendering, device HUDs, and contextual right-click menu all work with the pawn-following camera. New ASCII-styled nav/comms modal replicates the required retro radar layout and limits `E` interactions to the four console devices. 【F:interior_viewer.py†L40-L720】
-- **Orbit viewer UX** – Selecting a body locks the camera to it until the selection is cleared by clicking in empty space. Zooming is mouse-wheel-only, the scale marker is drawn in the lower-right corner, and ship hull outlines render when sufficiently zoomed in. Trails, selection info, and HUD styling retain the CRT aesthetic. 【F:admin_orbit_viewer.py†L1-L420】
+- **Shared dedicated server** – Both viewers consume the same TCP snapshots from the authoritative `ggw_world` server; no client launches its own sim instance.
+- **Interior viewer polish** – The pawn renders with the required four-circle silhouette, the camera follows it without manual panning, and right-click context menus show device info or per-tile atmosphere readouts (P, O₂, N₂, CO₂).
+- **Server-authoritative per-tile atmosphere** – Every floor-supporting tile stores its own gas masses, diffuses against its eight neighbors at 6 Hz, and remains active even when no clients are connected.
+- **Pawn life support** – Pawns breathe directly from their tile, consume O₂, emit CO₂, and take server-side health damage when exposed to vacuum, low pressure, or high CO₂; suffocation status is streamed to the HUD.
+- **Device modals** – Reactor, ShipComputer, Transponder, and NavStation all open with `E`, close via `ESC`, and expose the expected controls/status readouts. The Transponder modal now surfaces the broadcast ID and DM code.
+- **NavStation radar + comms UI** – The NavStation modal renders a drawn radar (planet, ship, contacts, heading vector) plus a tabbed COMMS panel with open-channel and encrypted-DM sections that reference the ship’s DM code.
+- **Doors and devices** – Interacting with doors, beds, dispensers, and other fixtures still works, and door toggles update the tile map without blocking the new atmosphere grid (door sealing will arrive in a later phase).
+- **Admin/orbit viewer parity** – Hull outlines, zoom scale marker, locked camera, and shared TCP stream remain intact so orbital + interior states stay in sync.
 
-## ❗ Outstanding Issues
-1. **Room-based atmosphere simulation** – `ShipInterior` still stores a single `AtmosCell` for the entire ship, so gas changes apply globally and do not respect room boundaries or floor regions. Implement a flood-fill per tick that groups contiguous floor tiles into regions, each with its own `AtmosCell`, and exchange gases through open doors/vents. 【F:src/interior.rs†L79-L260】
-2. **Door pressure equalization** – Because atmosphere is global, opening/closing doors does not affect localized pressure. Once regional atmospheres exist, door devices should link adjacent regions and equalize pressure by transferring mass proportionally to each region’s volume every simulation step. 【F:src/interior.rs†L784-L840】
-
-## Recommended Next Steps
-1. **Interior Atmos Regions**
-   - Track a `region_id` for each tile and rebuild regions when walls/doors change.
-   - Maintain a vector of `AtmosCell`s indexed by region and update `tile_atmos_sample` to read from the appropriate region.
-   - Update devices (dispenser, vents, leaks) to target the pawn’s current region.
-2. **Door Atmos Exchange**
-   - Associate each `DoorDevice` with the region IDs on both sides.
-   - During `ShipInterior::step`, if a door is open, compute the mass transfer needed to equalize pressure between the two regions over time (e.g., simple exponential decay).
-   - Emit events/telemetry so UI panels can surface door-induced pressure drops for QA.
-
-With these final items resolved, the interior simulation layer will meet all Phase 2 requirements and the team can proceed to combat & boarding (Phase 3).
+## 🔄 Remaining Work / Future Phases
+- Model airtight doors, vents, and fans so closed doors seal rooms instead of allowing free diffusion.
+- Add regional/flood-fill atmosphere management so devices can target specific rooms rather than raw tiles.
+- Implement range-limited, antenna-based comms plus DM code negotiation between ships.
+- Expand multi-ship/multi-pawn scenarios and add more QA coverage for simultaneous interiors.

@@ -1,5 +1,6 @@
+use std::cmp::Ordering;
 use std::env;
-use std::f64::consts::FRAC_PI_4;
+use std::f64::consts::{FRAC_PI_4, PI};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -306,6 +307,7 @@ fn build_snapshot_json(world: &World) -> String {
         DESPAWN_RADIUS_M,
         world.mu
     );
+    let nav_context = nav_context_json(world);
     for (index, body) in world.bodies.iter().enumerate() {
         if index > 0 {
             json.push(',');
@@ -337,12 +339,15 @@ fn build_snapshot_json(world: &World) -> String {
     }
     json.push_str("]");
     json.push(',');
-    json.push_str(&build_interior_json(&world.interior));
+    json.push_str(&build_interior_json(
+        &world.interior,
+        nav_context.as_deref(),
+    ));
     json.push('}');
     json
 }
 
-fn build_interior_json(interior: &InteriorWorld) -> String {
+fn build_interior_json(interior: &InteriorWorld, nav_context: Option<&str>) -> String {
     let ship = &interior.ship;
     let mut json = String::new();
     json.push_str("\"interior\":{");
@@ -376,6 +381,11 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
         json.push(']');
     }
     json.push_str("],");
+    if let Some(nav) = nav_context {
+        json.push_str("\"nav_context\":");
+        json.push_str(nav);
+        json.push_str(",");
+    }
     json.push_str("\"devices\":[");
     for (index, device) in ship.devices.iter().enumerate() {
         if index > 0 {
@@ -437,9 +447,10 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
             }
             DeviceData::Transponder(data) => {
                 json.push_str(&format!(
-                    ",\"callsign\":\"{}\",\"transponder_online\":{}",
+                    ",\"callsign\":\"{}\",\"transponder_online\":{},\"dm_code\":{}",
                     data.callsign,
-                    if data.online { "true" } else { "false" }
+                    if data.online { "true" } else { "false" },
+                    data.dm_code
                 ));
             }
             DeviceData::ShipComputer(data) => {
@@ -471,9 +482,10 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
         json.push('}');
     }
     json.push_str("],");
+    let totals = ship.total_atmos();
     json.push_str(&format!(
-        "\"atmos\":{{\"o2_kg\":{},\"n2_kg\":{},\"co2_kg\":{}}},",
-        ship.atmos.o2_kg, ship.atmos.n2_kg, ship.atmos.co2_kg
+        "\"atmos_totals\":{{\"o2_kg\":{},\"n2_kg\":{},\"co2_kg\":{}}},",
+        totals.o2_kg, totals.n2_kg, totals.co2_kg
     ));
     json.push_str(&format!(
         "\"power\":{{\"net_kw\":{},\"total_production_kw\":{},\"total_consumption_kw\":{}}},",
@@ -482,10 +494,11 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
     let pawn = &interior.pawn;
     json.push_str("\"pawn\":{");
     json.push_str(&format!(
-        "\"x\":{},\"y\":{},\"status\":\"{}\"",
+        "\"x\":{},\"y\":{},\"status\":\"{}\",\"suffocation_time\":{}",
         pawn.x,
         pawn.y,
-        pawn.status.as_str()
+        pawn.status.as_str(),
+        pawn.suffocation_time
     ));
     json.push_str(&format!(
         ",\"needs\":{{\"hunger\":{},\"thirst\":{},\"rest\":{}}}",
@@ -508,6 +521,87 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
     json.push('}');
     json.push('}');
     json
+}
+
+fn nav_context_json(world: &World) -> Option<String> {
+    let ship = world
+        .bodies
+        .iter()
+        .find(|body| body.body_type == BodyType::Ship)?;
+    let position = ship.position;
+    let velocity = ship.velocity;
+    let r = position.length();
+    if r <= 0.0 {
+        return None;
+    }
+    let v = velocity.length();
+    let mu = world.mu;
+    let dot_rv = position.x * velocity.x + position.y * velocity.y;
+    let energy = 0.5 * v * v - mu / r;
+    if !energy.is_finite() || energy >= 0.0 {
+        return None;
+    }
+    let semi_major = -mu / (2.0 * energy);
+    let e_vec = position
+        .scale(v * v - mu / r)
+        .sub(velocity.scale(dot_rv))
+        .scale(1.0 / mu);
+    let eccentricity = e_vec.length();
+    let apoapsis = semi_major * (1.0 + eccentricity);
+    let periapsis = semi_major * (1.0 - eccentricity);
+    let altitude = (r - world.planet_radius).max(0.0);
+    let apo_alt = (apoapsis - world.planet_radius).max(0.0);
+    let peri_alt = (periapsis - world.planet_radius).max(0.0);
+    let period = 2.0 * PI * (semi_major.powi(3) / mu).sqrt();
+    let heading = if position.x * velocity.y - position.y * velocity.x >= 0.0 {
+        "Prograde"
+    } else {
+        "Retrograde"
+    };
+    let mut contacts: Vec<(u64, &'static str, f64, f64, f64)> = world
+        .bodies
+        .iter()
+        .filter(|body| body.id != ship.id)
+        .map(|body| {
+            let dx = body.position.x - position.x;
+            let dy = body.position.y - position.y;
+            let dist = (dx * dx + dy * dy).sqrt();
+            (
+                body.id,
+                body_type_name(body.body_type),
+                body.position.x,
+                body.position.y,
+                dist,
+            )
+        })
+        .collect();
+    contacts.sort_by(|a, b| a.4.partial_cmp(&b.4).unwrap_or(Ordering::Equal));
+    contacts.truncate(4);
+    let mut nav_json = format!(
+        "{{\"altitude_m\":{},\"apoapsis_m\":{},\"periapsis_m\":{},\"speed_mps\":{},\"orbital_period_s\":{},\"heading\":\"{}\",\"ship_position\":{{\"x_m\":{},\"y_m\":{}}},\"ship_velocity\":{{\"x_mps\":{},\"y_mps\":{}}}",
+        altitude,
+        apo_alt,
+        peri_alt,
+        v,
+        period,
+        heading,
+        position.x,
+        position.y,
+        velocity.x,
+        velocity.y
+    );
+    nav_json.push_str(",\"contacts\":[");
+    for (index, (id, kind, x, y, _)) in contacts.iter().enumerate() {
+        if index > 0 {
+            nav_json.push(',');
+        }
+        nav_json.push_str(&format!(
+            "{{\"id\":{},\"body_type\":\"{}\",\"x_m\":{},\"y_m\":{}}}",
+            id, kind, x, y
+        ));
+    }
+    nav_json.push_str("]}");
+    Some(nav_json)
 }
 
 fn body_type_name(body_type: BodyType) -> &'static str {
