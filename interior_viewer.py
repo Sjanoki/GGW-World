@@ -42,6 +42,8 @@ COLORS = {
     "fg": (0, 255, 102),
     "fg_dim": (0, 138, 63),
     "highlight": (182, 255, 201),
+    "planet_fill": (6, 20, 10),
+    "planet_outline": (0, 180, 90),
 }
 
 INTERACTIVE_MODAL_KINDS = {
@@ -49,8 +51,6 @@ INTERACTIVE_MODAL_KINDS = {
     "NavStation",
     "Transponder",
     "ShipComputer",
-    "Dispenser",
-    "FoodGenerator",
 }
 
 MOVE_KEYS = {
@@ -63,6 +63,20 @@ MOVE_KEYS = {
     pygame.K_a: (-1, 0),
     pygame.K_d: (1, 0),
 }
+
+COMMS_LOG_LIMIT = 14
+COMMS_MENU_OPTIONS = [
+    "Request undocking clearance",
+    "SOS: Out of fuel",
+    "Request crew list",
+    "Show on nav map",
+]
+DEFAULT_COMMS_LOG = [
+    "[15:30] LINK: Connected to GGW-PORT",
+    "[15:31] CTRL: Cleared for departure. Have a safe flight.",
+]
+
+SHIP_POWER_GROUP_ORDER = ["Reactor", "Life Support", "Nav & Comms", "Misc"]
 
 FONT_SMALL: Optional[pygame.font.Font] = None
 FONT_MEDIUM: Optional[pygame.font.Font] = None
@@ -77,6 +91,11 @@ class ViewerState:
         self.selected_device_id: Optional[int] = None
         self.modal_device_id: Optional[int] = None
         self.context_tile: Optional[Tuple[int, int]] = None
+        self.navstation_tab: str = "NAV"
+        self.nav_tab_rects: Dict[str, pygame.Rect] = {}
+        self.nav_comms_log: List[str] = list(DEFAULT_COMMS_LOG)
+        self.nav_comms_selected: int = 0
+        self.shipcomp_selection: int = 0
 
 
 class ServerConnection:
@@ -212,6 +231,16 @@ def send_interact_device(conn: ServerConnection, device: Dict) -> None:
     send_interact_at(conn, x, y)
 
 
+def send_device_action(conn: ServerConnection, device_id: int, action: str) -> None:
+    payload = {"type": "device_action", "device_id": int(device_id), "action": action}
+    conn.send_json(payload)
+
+
+def send_ship_computer_toggle(conn: ServerConnection, device_id: int) -> None:
+    payload = {"type": "ship_computer_toggle", "device_id": int(device_id)}
+    conn.send_json(payload)
+
+
 def screen_to_tile(state: ViewerState, pos: Tuple[int, int]) -> Optional[Tuple[int, int]]:
     tile_size = state.tile_size
     if tile_size <= 0:
@@ -247,15 +276,15 @@ def build_atmo_lines(atmos: Optional[Dict[str, Any]]) -> List[str]:
     if not atmos:
         return []
     pressure = float(atmos.get("pressure_kpa", 0.0))
-    o2 = float(atmos.get("o2_fraction", 0.0)) * 100.0
-    n2 = float(atmos.get("n2_fraction", 0.0)) * 100.0
-    co2 = float(atmos.get("co2_fraction", 0.0)) * 100.0
+    o2 = float(atmos.get("o2_kg", 0.0))
+    n2 = float(atmos.get("n2_kg", 0.0))
+    co2 = float(atmos.get("co2_kg", 0.0))
     return [
         "Atmos:",
         f"  P: {pressure:.1f} kPa",
-        f"  O2: {o2:.1f} %",
-        f"  N2: {n2:.1f} %",
-        f"  CO2: {co2:.1f} %",
+        f"  O2: {o2:.2f} kg",
+        f"  N2: {n2:.2f} kg",
+        f"  CO2: {co2:.3f} kg",
     ]
 
 
@@ -266,7 +295,7 @@ def build_tile_context_lines(
     lines = [f"Pos: ({pos[0]}, {pos[1]})"]
     if tile_type == "Wall":
         lines.append("Standard wall. No atmosphere sample.")
-        return lines, "Wall"
+        return lines, "Standard Wall"
     atmo_lines = build_atmo_lines(tile_info.get("atmos"))
     if atmo_lines:
         lines.extend(atmo_lines)
@@ -309,6 +338,7 @@ def handle_events(
             if event.key == pygame.K_ESCAPE:
                 if state.modal_device_id is not None:
                     state.modal_device_id = None
+                    state.nav_tab_rects.clear()
                 elif state.selected_device_id is not None or state.context_tile is not None:
                     state.selected_device_id = None
                     state.context_tile = None
@@ -316,7 +346,7 @@ def handle_events(
                     return False
                 modal_open = state.modal_device_id is not None
             elif event.key == pygame.K_e and not modal_open:
-                try_open_modal(state, snapshot)
+                handle_interact_press(conn, state, snapshot)
                 modal_open = state.modal_device_id is not None
             elif modal_open and handle_modal_key(conn, state, snapshot, event.key):
                 continue
@@ -329,11 +359,123 @@ def handle_events(
             if event.button == 3:
                 if state.modal_device_id is None:
                     handle_right_click(state, snapshot, event.pos)
+            elif event.button == 1 and state.modal_device_id is not None:
+                if handle_nav_modal_click(state, snapshot, event.pos):
+                    continue
             elif event.button == 4:
                 state.zoom = clamp(state.zoom * ZOOM_STEP, ZOOM_MIN, ZOOM_MAX)
             elif event.button == 5:
                 state.zoom = clamp(state.zoom / ZOOM_STEP, ZOOM_MIN, ZOOM_MAX)
     return True
+
+
+def handle_interact_press(
+    conn: ServerConnection, state: ViewerState, snapshot: Optional[Dict]
+) -> None:
+    if not snapshot:
+        return
+    interior = snapshot.get("interior") or {}
+    device = find_device_near_pawn(interior)
+    if not device:
+        return
+    send_interact_device(conn, device)
+    if device_allows_modal(device):
+        state.modal_device_id = device.get("id")
+        kind = device.get("kind")
+        if kind == "NavStation":
+            state.navstation_tab = "NAV"
+        if kind == "ShipComputer":
+            state.shipcomp_selection = 0
+    else:
+        state.modal_device_id = None
+
+
+def handle_nav_modal_click(state: ViewerState, snapshot: Optional[Dict], pos: Tuple[int, int]) -> bool:
+    if snapshot is None:
+        return False
+    if state.modal_device_id is None:
+        return False
+    interior = snapshot.get("interior") or {}
+    device = find_selected_device(interior, state.modal_device_id)
+    if not device or device.get("kind") != "NavStation":
+        return False
+    for label, rect in state.nav_tab_rects.items():
+        if rect.collidepoint(pos):
+            state.navstation_tab = label
+            if label == "COMMS":
+                state.nav_comms_selected = 0
+            return True
+    return False
+
+
+def handle_nav_modal_keypress(state: ViewerState, key: int) -> bool:
+    if state.navstation_tab != "COMMS":
+        return False
+    if not COMMS_MENU_OPTIONS:
+        return False
+    if key in (pygame.K_UP, pygame.K_w):
+        state.nav_comms_selected = (state.nav_comms_selected - 1) % len(COMMS_MENU_OPTIONS)
+        return True
+    if key in (pygame.K_DOWN, pygame.K_s):
+        state.nav_comms_selected = (state.nav_comms_selected + 1) % len(COMMS_MENU_OPTIONS)
+        return True
+    if key in (pygame.K_RETURN, pygame.K_SPACE):
+        option = COMMS_MENU_OPTIONS[state.nav_comms_selected]
+        timestamp = time.strftime("%H:%M")
+        append_comms_log(state, f"[{timestamp}] SHIP: {option}")
+        print(f"COMMS >> {option}", flush=True)
+        return True
+    return False
+
+
+def append_comms_log(state: ViewerState, line: str) -> None:
+    state.nav_comms_log.append(line)
+    if len(state.nav_comms_log) > COMMS_LOG_LIMIT:
+        state.nav_comms_log = state.nav_comms_log[-COMMS_LOG_LIMIT:]
+
+
+def ship_computer_ordered_devices(summary: Dict) -> List[Dict]:
+    devices = summary.get("devices") or []
+    grouped: Dict[str, List[Dict]] = {}
+    for entry in devices:
+        group = entry.get("group", "Misc")
+        grouped.setdefault(group, []).append(entry)
+    ordered: List[Dict] = []
+    for group in SHIP_POWER_GROUP_ORDER:
+        for entry in sorted(grouped.get(group, []), key=lambda item: item.get("name", "")):
+            ordered.append(entry)
+    # Include any unexpected groups at the end
+    for group, entries in grouped.items():
+        if group in SHIP_POWER_GROUP_ORDER:
+            continue
+        for entry in sorted(entries, key=lambda item: item.get("name", "")):
+            ordered.append(entry)
+    return ordered
+
+
+def handle_ship_computer_modal_key(
+    conn: ServerConnection, state: ViewerState, snapshot: Optional[Dict], key: int
+) -> bool:
+    if snapshot is None:
+        return False
+    interior = snapshot.get("interior") or {}
+    summary = interior.get("power_summary") or {}
+    ordered = ship_computer_ordered_devices(summary)
+    if not ordered:
+        return False
+    state.shipcomp_selection = max(0, min(state.shipcomp_selection, len(ordered) - 1))
+    if key in (pygame.K_UP, pygame.K_w):
+        state.shipcomp_selection = (state.shipcomp_selection - 1) % len(ordered)
+        return True
+    if key in (pygame.K_DOWN, pygame.K_s):
+        state.shipcomp_selection = (state.shipcomp_selection + 1) % len(ordered)
+        return True
+    if key in (pygame.K_RETURN, pygame.K_SPACE):
+        selected = ordered[state.shipcomp_selection]
+        if selected.get("controllable"):
+            send_ship_computer_toggle(conn, int(selected.get("id", 0)))
+        return True
+    return False
 
 
 def draw_snapshot(screen: pygame.Surface, snapshot: Dict, state: ViewerState) -> None:
@@ -418,6 +560,24 @@ def draw_devices(screen: pygame.Surface, devices: List[Dict], state: ViewerState
                 text = FONT_SMALL.render(code, True, COLORS["bg"])
                 text_rect = text.get_rect(center=rect.center)
                 screen.blit(text, text_rect)
+        if kind == "DoorDevice":
+            open_state = device.get("open", False)
+            if open_state:
+                pygame.draw.line(
+                    screen,
+                    COLORS["highlight"],
+                    (rect.left + 4, rect.centery),
+                    (rect.right - 4, rect.centery),
+                    2,
+                )
+            else:
+                pygame.draw.line(
+                    screen,
+                    COLORS["highlight"],
+                    (rect.centerx, rect.top + 4),
+                    (rect.centerx, rect.bottom - 4),
+                    2,
+                )
 
 
 def device_label(kind: str) -> str:
@@ -496,6 +656,14 @@ def draw_device_modal(screen: pygame.Surface, snapshot: Dict, state: ViewerState
     device = find_selected_device(interior, state.modal_device_id)
     if not device:
         state.modal_device_id = None
+        state.nav_tab_rects.clear()
+        return
+    state.nav_tab_rects = {}
+    if device.get("kind") == "NavStation":
+        draw_navstation_modal(screen, snapshot, state, device)
+        return
+    if device.get("kind") == "ShipComputer":
+        draw_ship_computer_modal(screen, snapshot, state)
         return
     title, lines, action_lines = build_modal_content(device, snapshot)
     overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
@@ -533,6 +701,279 @@ def draw_device_modal(screen: pygame.Surface, snapshot: Dict, state: ViewerState
         y += FONT_SMALL.get_linesize()
 
 
+def draw_navstation_modal(
+    screen: pygame.Surface, snapshot: Dict, state: ViewerState, device: Dict
+) -> None:
+    if FONT_SMALL is None or FONT_MEDIUM is None:
+        return
+    interior = snapshot.get("interior") or {}
+    nav_context = interior.get("nav_context") or {}
+    if state.navstation_tab not in ("NAV", "COMMS"):
+        state.navstation_tab = "NAV"
+    overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 120))
+    screen.blit(overlay, (0, 0))
+    modal_width = int(WINDOW_WIDTH * 0.95)
+    modal_height = int(WINDOW_HEIGHT * 0.88)
+    panel_rect = pygame.Rect(
+        (WINDOW_WIDTH - modal_width) // 2,
+        (WINDOW_HEIGHT - modal_height) // 2,
+        modal_width,
+        modal_height,
+    )
+    pygame.draw.rect(screen, COLORS["hud_bg"], panel_rect)
+    pygame.draw.rect(screen, COLORS["hud_border"], panel_rect, width=2)
+    title = FONT_MEDIUM.render("NavStation", True, COLORS["fg"])
+    screen.blit(title, (panel_rect.left + PANEL_PADDING, panel_rect.top + PANEL_PADDING))
+    tab_top = panel_rect.top + PANEL_PADDING + FONT_MEDIUM.get_linesize() + 8
+    nav_rect = pygame.Rect(panel_rect.left + PANEL_PADDING, tab_top, 160, 36)
+    comm_rect = pygame.Rect(nav_rect.right + 16, tab_top, 180, 36)
+    state.nav_tab_rects = {"NAV": nav_rect, "COMMS": comm_rect}
+    for label, rect in state.nav_tab_rects.items():
+        active = state.navstation_tab == label
+        fill = COLORS["hud_bg"] if not active else (18, 30, 24)
+        pygame.draw.rect(screen, fill, rect)
+        pygame.draw.rect(screen, COLORS["hud_border"], rect, width=1)
+        text = FONT_SMALL.render(label, True, COLORS["fg"] if active else COLORS["fg_dim"])
+        text_rect = text.get_rect(center=rect.center)
+        screen.blit(text, text_rect)
+    content_top = nav_rect.bottom + 16
+    if state.navstation_tab != "COMMS":
+        radar_rect = pygame.Rect(
+            panel_rect.left + PANEL_PADDING,
+            content_top,
+            int(panel_rect.width * 0.55),
+            panel_rect.bottom - PANEL_PADDING - content_top,
+        )
+        draw_nav_radar(screen, radar_rect, nav_context, snapshot)
+        stats_rect = pygame.Rect(
+            radar_rect.right + 20,
+            content_top,
+            panel_rect.right - PANEL_PADDING - (radar_rect.right + 20),
+            panel_rect.bottom - PANEL_PADDING - content_top,
+        )
+        draw_nav_stats(screen, stats_rect, nav_context)
+    else:
+        draw_nav_comms(screen, panel_rect, content_top, interior, state)
+
+
+def draw_nav_radar(
+    screen: pygame.Surface, rect: pygame.Rect, nav_context: Dict, snapshot: Dict
+) -> None:
+    pygame.draw.rect(screen, COLORS["bg"], rect)
+    pygame.draw.rect(screen, COLORS["hud_border"], rect, width=1)
+    center = rect.center
+    max_radius = min(rect.width, rect.height) // 2 - 8
+    for ring in range(1, 4):
+        radius = int(max_radius * ring / 4)
+        pygame.draw.circle(screen, COLORS["grid"], center, radius, 1)
+    pygame.draw.line(screen, COLORS["grid"], (center[0], rect.top + 4), (center[0], rect.bottom - 4), 1)
+    pygame.draw.line(screen, COLORS["grid"], (rect.left + 4, center[1]), (rect.right - 4, center[1]), 1)
+    planet_radius = float(snapshot.get("planet_radius_m", 1.0))
+    ship_position = nav_context.get("ship_position") or {}
+    ship_velocity = nav_context.get("ship_velocity") or {}
+    ship_x = float(ship_position.get("x_m", 0.0))
+    ship_y = float(ship_position.get("y_m", 0.0))
+    ship_radius = math.hypot(ship_x, ship_y)
+    max_range = max(planet_radius + 1.0, ship_radius)
+    max_range = max(max_range, planet_radius + float(nav_context.get("apoapsis_m", 0.0)))
+    for contact in nav_context.get("contacts", []):
+        cx = float(contact.get("x_m", 0.0))
+        cy = float(contact.get("y_m", 0.0))
+        max_range = max(max_range, math.hypot(cx, cy))
+    scale = max_radius / max(max_range, 1.0)
+    planet_px = max(4, int(planet_radius * scale))
+    pygame.draw.circle(screen, COLORS["planet_fill"], center, min(planet_px, max_radius), 0)
+    pygame.draw.circle(screen, COLORS["planet_outline"], center, min(planet_px, max_radius), 2)
+    orbit_radius = int(ship_radius * scale)
+    if orbit_radius > 6:
+        pygame.draw.circle(screen, COLORS["grid"], center, min(orbit_radius, max_radius), 1)
+    ship_point = (
+        int(center[0] + ship_x * scale),
+        int(center[1] - ship_y * scale),
+    )
+    pygame.draw.circle(screen, COLORS["highlight"], ship_point, 6)
+    speed = math.hypot(float(ship_velocity.get("x_mps", 0.0)), float(ship_velocity.get("y_mps", 0.0)))
+    if speed > 0.0:
+        vx = float(ship_velocity.get("x_mps", 0.0)) / speed
+        vy = float(ship_velocity.get("y_mps", 0.0)) / speed
+        arrow_end = (
+            int(ship_point[0] + vx * 40),
+            int(ship_point[1] - vy * 40),
+        )
+        pygame.draw.line(screen, COLORS["highlight"], ship_point, arrow_end, 2)
+    for contact in nav_context.get("contacts", []):
+        cx = float(contact.get("x_m", 0.0))
+        cy = float(contact.get("y_m", 0.0))
+        point = (
+            int(center[0] + cx * scale),
+            int(center[1] - cy * scale),
+        )
+        pygame.draw.rect(screen, COLORS["fg_dim"], pygame.Rect(point[0] - 3, point[1] - 3, 6, 6), width=1)
+
+
+def draw_nav_stats(screen: pygame.Surface, rect: pygame.Rect, nav_context: Dict) -> None:
+    if FONT_SMALL is None:
+        return
+    lines = [
+        f"Altitude: {format_distance(float(nav_context.get('altitude_m', 0.0)))}",
+        f"Apoapsis: {format_distance(float(nav_context.get('apoapsis_m', 0.0)))}",
+        f"Periapsis: {format_distance(float(nav_context.get('periapsis_m', 0.0)))}",
+        f"Speed: {float(nav_context.get('speed_mps', 0.0)) / 1000:.2f} km/s",
+        f"Period: {float(nav_context.get('orbital_period_s', 0.0)) / 3600:.2f} h",
+        f"Heading: {nav_context.get('heading', 'Unknown')}",
+        "",
+        "Contacts:",
+    ]
+    ship_position = nav_context.get("ship_position") or {}
+    ship_x = float(ship_position.get("x_m", 0.0))
+    ship_y = float(ship_position.get("y_m", 0.0))
+    contacts = nav_context.get("contacts", [])
+    if not contacts:
+        lines.append("  None in range")
+    else:
+        for contact in contacts[:4]:
+            dx = float(contact.get("x_m", 0.0)) - ship_x
+            dy = float(contact.get("y_m", 0.0)) - ship_y
+            dist = math.hypot(dx, dy)
+            lines.append(
+                f"  {contact.get('body_type', 'Object')} #{int(contact.get('id', 0))}: {format_distance(dist)}"
+            )
+    y = rect.top
+    for line in lines:
+        text = FONT_SMALL.render(line, True, COLORS["fg"])
+        screen.blit(text, (rect.left, y))
+        y += FONT_SMALL.get_linesize()
+
+
+def draw_nav_comms(
+    screen: pygame.Surface,
+    panel_rect: pygame.Rect,
+    content_top: int,
+    interior: Dict,
+    state: ViewerState,
+) -> None:
+    if FONT_SMALL is None:
+        return
+    area = pygame.Rect(
+        panel_rect.left + PANEL_PADDING,
+        content_top,
+        panel_rect.width - PANEL_PADDING * 2,
+        panel_rect.bottom - PANEL_PADDING - content_top,
+    )
+    log_width = int(area.width * 0.6)
+    log_rect = pygame.Rect(area.left, area.top, log_width, area.height)
+    control_rect = pygame.Rect(log_rect.right + 16, area.top, area.right - log_rect.right - 16, area.height)
+    pygame.draw.rect(screen, COLORS["bg"], log_rect)
+    pygame.draw.rect(screen, COLORS["hud_border"], log_rect, width=1)
+    pygame.draw.rect(screen, COLORS["bg"], control_rect)
+    pygame.draw.rect(screen, COLORS["hud_border"], control_rect, width=1)
+    header = FONT_SMALL.render("COMMS LOG", True, COLORS["fg"])
+    screen.blit(header, (log_rect.left + PANEL_PADDING, log_rect.top + PANEL_PADDING))
+    y = log_rect.top + PANEL_PADDING + FONT_SMALL.get_linesize()
+    for line in state.nav_comms_log[-COMMS_LOG_LIMIT:]:
+        text = FONT_SMALL.render(line, True, COLORS["fg"])
+        screen.blit(text, (log_rect.left + PANEL_PADDING, y))
+        y += FONT_SMALL.get_linesize()
+    transponder = find_device_by_kind(interior, "Transponder") or {}
+    dm_code = transponder.get("dm_code", "----")
+    callsign = transponder.get("callsign", "N/A")
+    control_y = control_rect.top + PANEL_PADDING
+    for line in [f"Callsign: {callsign}", f"DM Code: {dm_code}", "", "COMMS CONTROL:"]:
+        text = FONT_SMALL.render(line, True, COLORS["fg"])
+        screen.blit(text, (control_rect.left + PANEL_PADDING, control_y))
+        control_y += FONT_SMALL.get_linesize()
+    for idx, option in enumerate(COMMS_MENU_OPTIONS):
+        selected = idx == state.nav_comms_selected
+        color = COLORS["fg"] if selected else COLORS["fg_dim"]
+        label = f"[{idx + 1}] {option}"
+        text = FONT_SMALL.render(label, True, color)
+        if selected:
+            highlight_rect = pygame.Rect(
+                control_rect.left + PANEL_PADDING - 4,
+                control_y - 4,
+                control_rect.width - PANEL_PADDING * 2 + 8,
+                FONT_SMALL.get_linesize() + 8,
+            )
+            pygame.draw.rect(screen, COLORS["grid"], highlight_rect)
+        screen.blit(text, (control_rect.left + PANEL_PADDING, control_y))
+        control_y += FONT_SMALL.get_linesize() + 4
+    footer = FONT_SMALL.render("[↑/↓] Select  [ENTER] Send  [ESC] Close", True, COLORS["fg_dim"])
+    screen.blit(footer, (control_rect.left + PANEL_PADDING, control_rect.bottom - FONT_SMALL.get_linesize() - PANEL_PADDING))
+
+
+def draw_ship_computer_modal(screen: pygame.Surface, snapshot: Dict, state: ViewerState) -> None:
+    if FONT_SMALL is None or FONT_MEDIUM is None:
+        return
+    interior = snapshot.get("interior") or {}
+    summary = interior.get("power_summary") or {}
+    overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 120))
+    screen.blit(overlay, (0, 0))
+    modal_width = int(WINDOW_WIDTH * 0.7)
+    modal_height = int(WINDOW_HEIGHT * 0.65)
+    panel_rect = pygame.Rect(
+        (WINDOW_WIDTH - modal_width) // 2,
+        (WINDOW_HEIGHT - modal_height) // 2,
+        modal_width,
+        modal_height,
+    )
+    pygame.draw.rect(screen, COLORS["hud_bg"], panel_rect)
+    pygame.draw.rect(screen, COLORS["hud_border"], panel_rect, width=2)
+    title = FONT_MEDIUM.render("Ship Computer", True, COLORS["fg"])
+    screen.blit(title, (panel_rect.left + PANEL_PADDING, panel_rect.top + PANEL_PADDING))
+    summary_text = (
+        f"GEN {summary.get('generation_kw', 0.0):.1f} kW  "
+        f"LOAD {summary.get('load_kw', 0.0):.1f} kW  "
+        f"NET {summary.get('net_kw', 0.0):+.1f} kW"
+    )
+    screen.blit(
+        FONT_SMALL.render(summary_text, True, COLORS["fg"]),
+        (panel_rect.left + PANEL_PADDING, panel_rect.top + PANEL_PADDING + FONT_MEDIUM.get_linesize()),
+    )
+    ordered = ship_computer_ordered_devices(summary)
+    if ordered:
+        state.shipcomp_selection = max(0, min(state.shipcomp_selection, len(ordered) - 1))
+    content_y = panel_rect.top + PANEL_PADDING + FONT_MEDIUM.get_linesize() + FONT_SMALL.get_linesize() + 8
+    row_height = FONT_SMALL.get_linesize() + 6
+    current_group = None
+    device_index = 0
+    for entry in ordered:
+        group = entry.get("group", "Misc")
+        if group != current_group:
+            current_group = group
+            group_text = FONT_SMALL.render(f"[{group}]", True, COLORS["fg"])
+            screen.blit(group_text, (panel_rect.left + PANEL_PADDING, content_y))
+            content_y += row_height
+        highlight = device_index == state.shipcomp_selection
+        row_rect = pygame.Rect(
+            panel_rect.left + PANEL_PADDING,
+            content_y,
+            panel_rect.width - PANEL_PADDING * 2,
+            row_height,
+        )
+        if highlight:
+            pygame.draw.rect(screen, COLORS["grid"], row_rect)
+        name = entry.get("name", "Device")
+        draw_kw = float(entry.get("draw_kw", 0.0))
+        status = "ONLINE" if entry.get("online", False) else "OFFLINE"
+        controllable = entry.get("controllable", False)
+        color = COLORS["fg"] if entry.get("online", False) else COLORS["fg_dim"]
+        text = FONT_SMALL.render(f"* {name:<18} ({draw_kw:>5.1f} kW)  {status}", True, color)
+        screen.blit(text, (row_rect.left + 6, row_rect.top + 2))
+        if controllable:
+            toggle_hint = FONT_SMALL.render("TOGGLE", True, COLORS["fg_dim"])
+            screen.blit(toggle_hint, (row_rect.right - toggle_hint.get_width() - 6, row_rect.top + 2))
+        content_y += row_height
+        device_index += 1
+    if not ordered:
+        empty = FONT_SMALL.render("No devices linked.", True, COLORS["fg_dim"])
+        screen.blit(empty, (panel_rect.left + PANEL_PADDING, content_y))
+    instructions = FONT_SMALL.render("[↑/↓] Select  [ENTER] Toggle  [ESC] Close", True, COLORS["fg_dim"])
+    screen.blit(
+        instructions,
+        (panel_rect.left + PANEL_PADDING, panel_rect.bottom - PANEL_PADDING - FONT_SMALL.get_linesize()),
+    )
 def build_modal_content(device: Dict, snapshot: Dict) -> Tuple[str, List[str], List[str]]:
     title = device.get("kind", "Device")
     lines = build_device_lines(device)
@@ -541,24 +982,16 @@ def build_modal_content(device: Dict, snapshot: Dict) -> Tuple[str, List[str], L
         status = "Online" if device.get("reactor_online") else "Offline"
         lines.append(f"Core state: {status}")
     elif kind == "NavStation":
-        nav = nav_stats(snapshot)
-        if nav:
-            lines.append(f"Alt: {format_distance(nav['altitude'])}")
-            lines.append(f"Ap: {format_distance(nav['apoapsis'])}")
-            lines.append(f"Pe: {format_distance(nav['periapsis'])}")
-            lines.append(f"Speed: {nav['speed'] / 1000:.2f} km/s")
-            lines.append(f"Period: {nav['period'] / 3600:.2f} h")
-            lines.append(f"Heading: {nav['heading']}")
-        else:
-            lines.append("Nav data unavailable")
+        lines.append("Nav telemetry available in console view.")
     elif kind == "ShipComputer":
         total = len(snapshot.get("interior", {}).get("devices", []))
         lines.append(f"Devices linked: {total}")
     elif kind == "Transponder":
         callsign = device.get("callsign", "N/A")
         lines.append(f"Broadcast ID: {callsign}")
+        lines.append(f"DM Code: {device.get('dm_code', '----')}")
 
-    action_lines = [label for _, label in modal_action_specs(device)]
+    action_lines = [label for _, label, _ in modal_action_specs(device)]
     if action_lines:
         action_lines.append("[ESC] Close")
     else:
@@ -566,15 +999,13 @@ def build_modal_content(device: Dict, snapshot: Dict) -> Tuple[str, List[str], L
     return title, lines, action_lines
 
 
-def modal_action_specs(device: Dict) -> List[Tuple[int, str]]:
+def modal_action_specs(device: Dict) -> List[Tuple[int, str, str]]:
     kind = device.get("kind")
-    specs: List[Tuple[int, str]] = []
+    specs: List[Tuple[int, str, str]] = []
     if kind == "ReactorUranium":
-        specs.append((pygame.K_t, "[T] Toggle reactor"))
+        specs.append((pygame.K_t, "[T] Toggle reactor", "toggle"))
     elif kind == "Dispenser":
-        specs.append((pygame.K_t, "[T] Toggle dispenser"))
-    if kind == "FoodGenerator":
-        specs.append((pygame.K_f, "[F] Eat meal"))
+        specs.append((pygame.K_t, "[T] Toggle dispenser", "toggle"))
     return specs
 
 
@@ -591,20 +1022,17 @@ def handle_modal_key(
     if not device:
         state.modal_device_id = None
         return False
-    for action_key, _ in modal_action_specs(device):
+    kind = device.get("kind")
+    if kind == "NavStation":
+        return handle_nav_modal_keypress(state, key)
+    if kind == "ShipComputer":
+        return handle_ship_computer_modal_key(conn, state, snapshot, key)
+    for action_key, _, action_name in modal_action_specs(device):
         if key == action_key:
-            send_interact_device(conn, device)
+            send_device_action(conn, int(device.get("id", 0)), action_name)
             return True
     return False
 
-
-def try_open_modal(state: ViewerState, snapshot: Optional[Dict]) -> None:
-    if not snapshot:
-        return
-    interior = snapshot.get("interior") or {}
-    device = find_device_near_pawn(interior)
-    if device and device_allows_modal(device):
-        state.modal_device_id = device.get("id")
 
 def draw_pawn_panel(screen: pygame.Surface, interior: Dict) -> None:
     if FONT_SMALL is None or FONT_MEDIUM is None:
@@ -612,12 +1040,14 @@ def draw_pawn_panel(screen: pygame.Surface, interior: Dict) -> None:
     pawn = interior.get("pawn", {})
     needs = pawn.get("needs", {})
     health = (pawn.get("health") or {}).get("body_parts", [])
+    power_summary = interior.get("power_summary") or interior.get("power") or {}
     lines = [
         f"Status: {pawn.get('status', 'Unknown')}",
         f"Hunger: {needs.get('hunger', 0.0) * 100:.0f}%",
         f"Thirst: {needs.get('thirst', 0.0) * 100:.0f}%",
         f"Rest: {needs.get('rest', 0.0) * 100:.0f}%",
-        f"Net power: {interior.get('power', {}).get('net_kw', 0.0):.1f} kW",
+        f"Suffocation: {pawn.get('suffocation_time', 0.0):.1f} s",
+        f"Net power: {power_summary.get('net_kw', 0.0):+.1f} kW",
     ]
     line_height = FONT_SMALL.get_linesize()
     label_widths = [FONT_SMALL.size(line)[0] for line in lines]
@@ -696,6 +1126,13 @@ def find_device_at(interior: Dict, tx: int, ty: int) -> Optional[Dict]:
     return None
 
 
+def find_device_by_kind(interior: Dict, kind: str) -> Optional[Dict]:
+    for device in interior.get("devices", []):
+        if device.get("kind") == kind:
+            return device
+    return None
+
+
 def device_contains_tile(device: Dict, tx: int, ty: int) -> bool:
     x = device.get("x", 0)
     y = device.get("y", 0)
@@ -737,49 +1174,6 @@ def find_device_near_pawn(interior: Dict) -> Optional[Dict]:
     return best
 
 
-def nav_stats(snapshot: Dict) -> Optional[Dict[str, float]]:
-    ship = primary_ship_body(snapshot)
-    if not ship:
-        return None
-    mu = float(snapshot.get("mu", 0.0))
-    planet_radius = float(snapshot.get("planet_radius_m", 0.0))
-    if mu <= 0.0:
-        return None
-    x = float(ship.get("x", 0.0))
-    y = float(ship.get("y", 0.0))
-    vx = float(ship.get("vx", 0.0))
-    vy = float(ship.get("vy", 0.0))
-    r = math.hypot(x, y)
-    if r <= 0.0:
-        return None
-    speed = math.hypot(vx, vy)
-    dot_rv = x * vx + y * vy
-    e_vec_x = ((speed * speed - mu / r) * x - dot_rv * vx) / mu
-    e_vec_y = ((speed * speed - mu / r) * y - dot_rv * vy) / mu
-    eccentricity = math.hypot(e_vec_x, e_vec_y)
-    denom = 2.0 / r - (speed * speed) / mu
-    if abs(denom) < 1e-9:
-        return None
-    semi_major = 1.0 / denom
-    if semi_major <= 0.0:
-        return None
-    apoapsis = semi_major * (1.0 + eccentricity)
-    periapsis = semi_major * (1.0 - eccentricity)
-    altitude = max(0.0, r - planet_radius)
-    apo_alt = max(0.0, apoapsis - planet_radius)
-    peri_alt = max(0.0, periapsis - planet_radius)
-    period = 2.0 * math.pi * math.sqrt(semi_major ** 3 / mu)
-    heading = "Prograde" if x * vy - y * vx >= 0.0 else "Retrograde"
-    return {
-        "altitude": altitude,
-        "apoapsis": apo_alt,
-        "periapsis": peri_alt,
-        "speed": speed,
-        "period": period,
-        "heading": heading,
-    }
-
-
 def build_device_lines(device: Dict) -> List[str]:
     lines = [
         f"Pos: ({device.get('x', 0)}, {device.get('y', 0)})",
@@ -807,6 +1201,7 @@ def build_device_lines(device: Dict) -> List[str]:
         lines.append(f"Food: {device.get('food_units', 0.0):.1f} units")
     elif kind == "Transponder":
         lines.append(f"Callsign: {device.get('callsign', 'N/A')}")
+        lines.append(f"DM Code: {device.get('dm_code', '----')}")
     elif kind == "ShipComputer":
         lines.append(f"Online: {device.get('ship_computer_online', False)}")
     return lines

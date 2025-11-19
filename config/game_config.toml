@@ -1,0 +1,89 @@
+[atmosphere]
+tile_size_m        = 1.0
+tile_height_m      = 2.0
+baseline_temp_c    = 20.0
+tick_interval_s    = 0.25
+
+[atmosphere.gases.O2]
+display_name          = "Oxygen"
+molar_mass_kg_per_mol = 0.031998
+default_mass_kg       = 0.5585
+
+[atmosphere.gases.N2]
+display_name          = "Nitrogen"
+molar_mass_kg_per_mol = 0.0280134
+default_mass_kg       = 1.8393
+
+[atmosphere.gases.CO2]
+display_name          = "Carbon Dioxide"
+molar_mass_kg_per_mol = 0.04401
+default_mass_kg       = 0.0015
+
+[items.reactor_uranium]
+display_name   = "Reactor (Uranium)"
+idle_power_kw  = 0.0
+online_power_kw = -500.0
+
+[items.nav_station]
+display_name   = "NavStation"
+idle_power_kw  = 1.5
+
+[items.ship_computer]
+display_name   = "ShipComputer"
+idle_power_kw  = 2.5
+
+[items.transponder]
+display_name   = "Transponder"
+idle_power_kw  = 5.0
+
+[items.food_generator]
+display_name   = "FoodGenerator"
+idle_power_kw  = 2.0
+
+[items.tank]
+display_name   = "Tank"
+idle_power_kw  = 0.25
+capacity_kg    = 100.0
+
+[items.dispenser]
+display_name   = "Dispenser"
+idle_power_kw  = 0.25
+flow_kg_per_s  = 0.02
+gas_type       = "O2"
+
+[items.light]
+display_name   = "Light"
+idle_power_kw  = 0.1
+
+[items.bed]
+display_name   = "BedDevice"
+idle_power_kw  = 0.0
+
+[items.door]
+display_name   = "Door"
+idle_power_kw  = 0.0
+
+[default_tank]
+o2_mass_kg  = 80.0
+n2_mass_kg  = 0.0
+co2_mass_kg = 0.0
+
+[power]
+reactor_output_kw  = 500.0
+nav_station_kw     = 1.5
+ship_computer_kw   = 2.5
+transponder_kw     = 5.0
+dispenser_kw       = 0.5
+food_generator_kw  = 0.5
+light_kw           = 0.1
+bed_kw             = 0.0
+door_kw            = 0.0
+
+[resources.iron_ore]
+density_kg_per_m3 = 5200.0
+
+[resources.gold_ore]
+density_kg_per_m3 = 19300.0
+
+[resources.silver_ore]
+density_kg_per_m3 = 10490.0

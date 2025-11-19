@@ -1,15 +1,15 @@
+use std::cmp::Ordering;
 use std::env;
-use std::f64::consts::FRAC_PI_4;
+use std::f64::consts::{FRAC_PI_4, PI};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
-use std::f64::consts::FRAC_PI_4;
-use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ggw_world::{
-    interior::{DeviceData, GasType, InteriorCommand, InteriorWorld},
+    config::GameConfig,
+    interior::{DeviceAction, DeviceData, GasType, InteriorCommand, InteriorWorld},
     BodyState, BodyType, HullShape, OrbitState, Vec2, World, DESPAWN_RADIUS_M,
     GRAVITY_WELL_RADIUS_M, PLANET_RADIUS_M, TILE_SIZE_METERS,
 };
@@ -20,6 +20,7 @@ const MAX_TIME_SCALE: f64 = 10_000.0;
 const MAX_SIM_DT: f64 = 1.0;
 const SNAPSHOT_SLEEP_MS: u64 = 50;
 const SERVER_ADDR: &str = "127.0.0.1:40000";
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--stdio") {
@@ -30,21 +31,25 @@ fn main() {
 }
 
 fn run_stdio_mode() {
-    let mut world = build_initial_world();
-    let stdin_thread = spawn_command_listener();
+    let mut world = build_initial_world(GameConfig::load());
+    let stdin_listener = spawn_command_listener();
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     let mut time_scale = DEFAULT_TIME_SCALE;
     let mut last_real = Instant::now();
 
     loop {
-        for command in stdin_thread.drain_commands() {
+        for command in stdin_listener.drain_commands() {
             apply_command(&mut world, command, &mut time_scale);
         }
 
         let snapshot_json = tick_world(&mut world, time_scale, &mut last_real);
-        writeln!(handle, "{}", snapshot_json).expect("stdout write");
-        handle.flush().expect("stdout flush");
+        if writeln!(handle, "{}", snapshot_json).is_err() {
+            break;
+        }
+        if handle.flush().is_err() {
+            break;
+        }
         thread::sleep(Duration::from_millis(SNAPSHOT_SLEEP_MS));
     }
 }
@@ -53,7 +58,7 @@ fn run_tcp_server() {
     let listener = TcpListener::bind(SERVER_ADDR).expect("failed to bind TCP listener");
     println!("GGW server listening on {}", SERVER_ADDR);
 
-    let mut world = build_initial_world();
+    let mut world = build_initial_world(GameConfig::load());
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
     let (new_client_tx, new_client_rx) = mpsc::channel::<mpsc::Sender<String>>();
 
@@ -140,19 +145,8 @@ fn spawn_client_connection(
     snapshot_tx
 }
 
-fn build_initial_world() -> World {
-    BodyState, BodyType, OrbitState, Vec2, World, DESPAWN_RADIUS_M, GRAVITY_WELL_RADIUS_M,
-    PLANET_RADIUS_M,
-};
-
-const MU_EARTH: f64 = 3.986_004_418e14;
-const DEFAULT_DT_SECONDS: f64 = 10.0;
-const MAX_TIME_SCALE: f64 = 10_000.0;
-const MAX_SIM_DT: f64 = 1.0;
-const SNAPSHOT_SLEEP_MS: u64 = 50;
-
-fn main() {
-    let mut world = World::new(MU_EARTH);
+fn build_initial_world(config: GameConfig) -> World {
+    let mut world = World::new(MU_EARTH, config);
     let r_planet = PLANET_RADIUS_M;
 
     let ship_orbit = OrbitState {
@@ -239,41 +233,16 @@ fn apply_command(world: &mut World, command: Command, time_scale: &mut f64) {
                 .interior
                 .queue_command(InteriorCommand::InteractAt { x, y });
         }
-    world.add_body(sample_body(1, BodyType::Ship, ship_orbit, 20.0));
-    world.add_body(sample_body(2, BodyType::Asteroid, asteroid_orbit, 1_000.0));
-    world.add_body(sample_body(3, BodyType::Debris, debris_orbit, 10.0));
-
-    // Prime cached position/velocity fields.
-    world.step(0.0);
-
-    let stdin_thread = spawn_command_listener();
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    let mut time_scale = DEFAULT_DT_SECONDS;
-    let mut last_real = Instant::now();
-
-    loop {
-        if let Some(new_scale) = stdin_thread.try_recv_time_scale() {
-            time_scale = new_scale;
+        Command::DeviceAction { device_id, action } => {
+            world
+                .interior
+                .queue_command(InteriorCommand::DeviceAction { device_id, action });
         }
-
-        let now = Instant::now();
-        let real_dt = now.duration_since(last_real).as_secs_f64();
-        last_real = now;
-
-        let mut sim_dt = time_scale * real_dt;
-        if sim_dt > MAX_SIM_DT {
-            sim_dt = MAX_SIM_DT;
+        Command::ShipComputerToggle { device_id } => {
+            world
+                .interior
+                .queue_command(InteriorCommand::ShipComputerToggle { device_id });
         }
-        if sim_dt < 0.0 {
-            sim_dt = 0.0;
-        }
-
-        world.step(sim_dt);
-        let snapshot_json = build_snapshot_json(&world);
-        writeln!(handle, "{}", snapshot_json).expect("stdout write");
-        handle.flush().expect("stdout flush");
-        thread::sleep(Duration::from_millis(SNAPSHOT_SLEEP_MS));
     }
 }
 
@@ -294,18 +263,6 @@ impl CommandListener {
                 }
                 Err(TryRecvError::Empty) => return commands,
                 Err(TryRecvError::Disconnected) => return commands,
-    fn try_recv_time_scale(&self) -> Option<f64> {
-        use std::sync::mpsc::TryRecvError;
-        let mut latest: Option<f64> = None;
-        loop {
-            match self.receiver.try_recv() {
-                Ok(line) => {
-                    if let Some(scale) = parse_time_scale_command(&line) {
-                        latest = Some(scale);
-                    }
-                }
-                Err(TryRecvError::Empty) => return latest,
-                Err(TryRecvError::Disconnected) => return latest,
             }
         }
     }
@@ -344,11 +301,6 @@ fn sample_body(
         id,
         mass: 1_000.0,
         radius: adjusted_radius,
-fn sample_body(id: u64, body_type: BodyType, orbit: OrbitState, radius: f64) -> BodyState {
-    BodyState {
-        id,
-        mass: 1_000.0,
-        radius,
         orbit,
         position: Vec2::zero(),
         velocity: Vec2::zero(),
@@ -366,6 +318,7 @@ fn build_snapshot_json(world: &World) -> String {
         DESPAWN_RADIUS_M,
         world.mu
     );
+    let nav_context = nav_context_json(world);
     for (index, body) in world.bodies.iter().enumerate() {
         if index > 0 {
             json.push(',');
@@ -373,8 +326,6 @@ fn build_snapshot_json(world: &World) -> String {
         json.push('{');
         json.push_str(&format!(
             "\"id\":{},\"body_type\":\"{}\",\"radius_m\":{},\"x\":{},\"y\":{},\"vx\":{},\"vy\":{}",
-        json.push_str(&format!(
-            "{{\"id\":{},\"body_type\":\"{}\",\"radius_m\":{},\"x\":{},\"y\":{},\"vx\":{},\"vy\":{}}}",
             body.id,
             body_type_name(body.body_type),
             body.radius,
@@ -399,12 +350,20 @@ fn build_snapshot_json(world: &World) -> String {
     }
     json.push_str("]");
     json.push(',');
-    json.push_str(&build_interior_json(&world.interior));
+    json.push_str(&build_interior_json(
+        &world.interior,
+        nav_context.as_deref(),
+        &world.config,
+    ));
     json.push('}');
     json
 }
 
-fn build_interior_json(interior: &InteriorWorld) -> String {
+fn build_interior_json(
+    interior: &InteriorWorld,
+    nav_context: Option<&str>,
+    config: &GameConfig,
+) -> String {
     let ship = &interior.ship;
     let mut json = String::new();
     json.push_str("\"interior\":{");
@@ -425,10 +384,10 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
             let tile_type = ship.tile_type(x, y);
             json.push('{');
             json.push_str(&format!("\"type\":\"{}\"", tile_type.as_str()));
-            if let Some(sample) = ship.tile_atmos_sample(x, y) {
+            if let Some(sample) = ship.tile_atmos_sample(x, y, &config.atmosphere) {
                 json.push_str(&format!(
-                    ",\"atmos\":{{\"pressure_kpa\":{},\"o2_fraction\":{},\"n2_fraction\":{},\"co2_fraction\":{}}}",
-                    sample.pressure_kpa, sample.o2_fraction, sample.n2_fraction, sample.co2_fraction
+                    ",\"atmos\":{{\"pressure_kpa\":{},\"o2_kg\":{},\"n2_kg\":{},\"co2_kg\":{}}}",
+                    sample.pressure_kpa, sample.o2_kg, sample.n2_kg, sample.co2_kg
                 ));
             } else {
                 json.push_str(",\"atmos\":null");
@@ -438,6 +397,11 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
         json.push(']');
     }
     json.push_str("],");
+    if let Some(nav) = nav_context {
+        json.push_str("\"nav_context\":");
+        json.push_str(nav);
+        json.push_str(",");
+    }
     json.push_str("\"devices\":[");
     for (index, device) in ship.devices.iter().enumerate() {
         if index > 0 {
@@ -499,9 +463,10 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
             }
             DeviceData::Transponder(data) => {
                 json.push_str(&format!(
-                    ",\"callsign\":\"{}\",\"transponder_online\":{}",
+                    ",\"callsign\":\"{}\",\"transponder_online\":{},\"dm_code\":{}",
                     data.callsign,
-                    if data.online { "true" } else { "false" }
+                    if data.online { "true" } else { "false" },
+                    data.dm_code
                 ));
             }
             DeviceData::ShipComputer(data) => {
@@ -533,21 +498,43 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
         json.push('}');
     }
     json.push_str("],");
+    let totals = ship.total_atmos();
     json.push_str(&format!(
-        "\"atmos\":{{\"o2_kg\":{},\"n2_kg\":{},\"co2_kg\":{}}},",
-        ship.atmos.o2_kg, ship.atmos.n2_kg, ship.atmos.co2_kg
+        "\"atmos_totals\":{{\"o2_kg\":{},\"n2_kg\":{},\"co2_kg\":{}}},",
+        totals.o2_kg, totals.n2_kg, totals.co2_kg
     ));
     json.push_str(&format!(
         "\"power\":{{\"net_kw\":{},\"total_production_kw\":{},\"total_consumption_kw\":{}}},",
         ship.power.net_kw, ship.power.total_production_kw, ship.power.total_consumption_kw
     ));
+    let summary = &ship.power_summary;
+    json.push_str(&format!(
+        "\"power_summary\":{{\"generation_kw\":{},\"load_kw\":{},\"net_kw\":{},\"devices\":[",
+        summary.generation_kw, summary.load_kw, summary.net_kw
+    ));
+    for (idx, device) in summary.devices.iter().enumerate() {
+        if idx > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"id\":{},\"name\":\"{}\",\"group\":\"{}\",\"draw_kw\":{},\"online\":{},\"controllable\":{}}}",
+            device.id,
+            device.name,
+            device.group.as_str(),
+            device.draw_kw,
+            if device.online { "true" } else { "false" },
+            if device.controllable { "true" } else { "false" }
+        ));
+    }
+    json.push_str("]},");
     let pawn = &interior.pawn;
     json.push_str("\"pawn\":{");
     json.push_str(&format!(
-        "\"x\":{},\"y\":{},\"status\":\"{}\"",
+        "\"x\":{},\"y\":{},\"status\":\"{}\",\"suffocation_time\":{}",
         pawn.x,
         pawn.y,
-        pawn.status.as_str()
+        pawn.status.as_str(),
+        pawn.suffocation_time
     ));
     json.push_str(&format!(
         ",\"needs\":{{\"hunger\":{},\"thirst\":{},\"rest\":{}}}",
@@ -569,9 +556,88 @@ fn build_interior_json(interior: &InteriorWorld) -> String {
     json.push_str("]}");
     json.push('}');
     json.push('}');
-    }
-    json.push_str("]}");
     json
+}
+
+fn nav_context_json(world: &World) -> Option<String> {
+    let ship = world
+        .bodies
+        .iter()
+        .find(|body| body.body_type == BodyType::Ship)?;
+    let position = ship.position;
+    let velocity = ship.velocity;
+    let r = position.length();
+    if r <= 0.0 {
+        return None;
+    }
+    let v = velocity.length();
+    let mu = world.mu;
+    let dot_rv = position.x * velocity.x + position.y * velocity.y;
+    let energy = 0.5 * v * v - mu / r;
+    if !energy.is_finite() || energy >= 0.0 {
+        return None;
+    }
+    let semi_major = -mu / (2.0 * energy);
+    let e_vec = position
+        .scale(v * v - mu / r)
+        .sub(velocity.scale(dot_rv))
+        .scale(1.0 / mu);
+    let eccentricity = e_vec.length();
+    let apoapsis = semi_major * (1.0 + eccentricity);
+    let periapsis = semi_major * (1.0 - eccentricity);
+    let altitude = (r - world.planet_radius).max(0.0);
+    let apo_alt = (apoapsis - world.planet_radius).max(0.0);
+    let peri_alt = (periapsis - world.planet_radius).max(0.0);
+    let period = 2.0 * PI * (semi_major.powi(3) / mu).sqrt();
+    let heading = if position.x * velocity.y - position.y * velocity.x >= 0.0 {
+        "Prograde"
+    } else {
+        "Retrograde"
+    };
+    let mut contacts: Vec<(u64, &'static str, f64, f64, f64)> = world
+        .bodies
+        .iter()
+        .filter(|body| body.id != ship.id)
+        .map(|body| {
+            let dx = body.position.x - position.x;
+            let dy = body.position.y - position.y;
+            let dist = (dx * dx + dy * dy).sqrt();
+            (
+                body.id,
+                body_type_name(body.body_type),
+                body.position.x,
+                body.position.y,
+                dist,
+            )
+        })
+        .collect();
+    contacts.sort_by(|a, b| a.4.partial_cmp(&b.4).unwrap_or(Ordering::Equal));
+    contacts.truncate(4);
+    let mut nav_json = format!(
+        "{{\"altitude_m\":{},\"apoapsis_m\":{},\"periapsis_m\":{},\"speed_mps\":{},\"orbital_period_s\":{},\"heading\":\"{}\",\"ship_position\":{{\"x_m\":{},\"y_m\":{}}},\"ship_velocity\":{{\"x_mps\":{},\"y_mps\":{}}}",
+        altitude,
+        apo_alt,
+        peri_alt,
+        v,
+        period,
+        heading,
+        position.x,
+        position.y,
+        velocity.x,
+        velocity.y
+    );
+    nav_json.push_str(",\"contacts\":[");
+    for (index, (id, kind, x, y, _)) in contacts.iter().enumerate() {
+        if index > 0 {
+            nav_json.push(',');
+        }
+        nav_json.push_str(&format!(
+            "{{\"id\":{},\"body_type\":\"{}\",\"x_m\":{},\"y_m\":{}}}",
+            id, kind, x, y
+        ));
+    }
+    nav_json.push_str("]}");
+    Some(nav_json)
 }
 
 fn body_type_name(body_type: BodyType) -> &'static str {
@@ -596,6 +662,36 @@ fn parse_command(line: &str) -> Option<Command> {
     let trimmed = line.trim();
     if !trimmed.starts_with('{') {
         return None;
+    }
+    if let Some(cmd_type) = extract_string(trimmed, "\"type\"") {
+        match cmd_type.as_str() {
+            "set_time_scale" => return parse_time_scale_command(trimmed).map(Command::SetTimeScale),
+            "move_pawn" => {
+                let dx = extract_number::<i32>(trimmed, "\"dx\"")?;
+                let dy = extract_number::<i32>(trimmed, "\"dy\"")?;
+                return Some(Command::MovePawn { dx, dy });
+            }
+            "toggle_sleep" => return Some(Command::ToggleSleep),
+            "interact_at" => {
+                let x = extract_number::<u32>(trimmed, "\"x\"")?;
+                let y = extract_number::<u32>(trimmed, "\"y\"")?;
+                return Some(Command::InteractAt { x, y });
+            }
+            "device_action" => {
+                let device_id = extract_number::<u64>(trimmed, "\"device_id\"")?;
+                let action = extract_string(trimmed, "\"action\"")?;
+                let action = match action.to_ascii_lowercase().as_str() {
+                    "toggle" => DeviceAction::Toggle,
+                    _ => return None,
+                };
+                return Some(Command::DeviceAction { device_id, action });
+            }
+            "ship_computer_toggle" => {
+                let device_id = extract_number::<u64>(trimmed, "\"device_id\"")?;
+                return Some(Command::ShipComputerToggle { device_id });
+            }
+            _ => {}
+        }
     }
     if trimmed.contains("set_time_scale") {
         return parse_time_scale_command(trimmed).map(Command::SetTimeScale);
@@ -631,14 +727,6 @@ fn clamp_time_scale(value: f64) -> f64 {
 fn extract_number<T: core::str::FromStr>(line: &str, key: &str) -> Option<T> {
     let start = line.find(key)? + key.len();
     let after_key = line.get(start..)?;
-fn parse_time_scale_command(line: &str) -> Option<f64> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('{') || !trimmed.contains("set_time_scale") {
-        return None;
-    }
-    let key = "\"time_scale\"";
-    let start = trimmed.find(key)? + key.len();
-    let after_key = trimmed.get(start..)?;
     let colon_index = after_key.find(':')?;
     let after_colon = after_key.get(colon_index + 1..)?.trim_start();
     let end_index = after_colon
@@ -648,21 +736,24 @@ fn parse_time_scale_command(line: &str) -> Option<f64> {
     value_str.parse::<T>().ok()
 }
 
+fn extract_string(line: &str, key: &str) -> Option<String> {
+    let start = line.find(key)? + key.len();
+    let after_key = line.get(start..)?;
+    let colon_index = after_key.find(':')?;
+    let after_colon = after_key.get(colon_index + 1..)?.trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let rest = &after_colon[1..];
+    let end_index = rest.find('"')?;
+    Some(rest[..end_index].to_string())
+}
+
 enum Command {
     SetTimeScale(f64),
     MovePawn { dx: i32, dy: i32 },
     ToggleSleep,
     InteractAt { x: u32, y: u32 },
-    value_str
-        .parse::<f64>()
-        .ok()
-        .map(|value| clamp_time_scale(value))
-}
-
-fn clamp_time_scale(value: f64) -> f64 {
-    if value.is_nan() {
-        DEFAULT_DT_SECONDS
-    } else {
-        value.max(0.0).min(MAX_TIME_SCALE)
-    }
+    DeviceAction { device_id: u64, action: DeviceAction },
+    ShipComputerToggle { device_id: u64 },
 }
